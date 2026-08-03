@@ -1,0 +1,303 @@
+<!doctype html>
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Memecoin Bot — Dashboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.4/chart.umd.min.js"></script>
+<style>
+  :root {
+    --bg: #08070c;
+    --panel: #121019;
+    --panel-2: #17141f;
+    --line: #2a2438;
+    --purple: #9945ff;
+    --green: #14f195;
+    --red: #ef4444;
+    --amber: #f5a524;
+    --ink: #f4f2fa;
+    --mute: #8b85a3;
+    --mono: 'SF Mono', 'Cascadia Code', Consolas, monospace;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font-family: var(--mono); font-size: 13px;
+    -webkit-font-smoothing: antialiased;
+  }
+  header {
+    display: flex; align-items: baseline; gap: 12px;
+    padding: 18px 24px; border-bottom: 1px solid var(--line);
+    position: sticky; top: 0; background: var(--bg); z-index: 10;
+  }
+  header .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px var(--green); }
+  header h1 { font-size: 15px; font-weight: 600; letter-spacing: .04em; margin: 0; text-transform: uppercase; }
+  header .sub { color: var(--mute); font-size: 12px; }
+  header .clock { margin-left: auto; color: var(--mute); font-size: 12px; }
+
+  .wrap { padding: 20px 24px 60px; max-width: 1400px; margin: 0 auto; }
+
+  .grid-stats {
+    display: grid; grid-template-columns: repeat(5, 1fr); gap: 12px; margin-bottom: 20px;
+  }
+  .stat {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    padding: 14px 16px;
+  }
+  .stat .label { color: var(--mute); font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; margin-bottom: 6px; }
+  .stat .value { font-size: 22px; font-weight: 600; }
+  .stat .value.green { color: var(--green); }
+  .stat .value.red { color: var(--red); }
+  .stat .value.amber { color: var(--amber); }
+
+  .panel {
+    background: var(--panel); border: 1px solid var(--line); border-radius: 6px;
+    margin-bottom: 16px; overflow: hidden;
+  }
+  .panel-h {
+    padding: 10px 16px; border-bottom: 1px solid var(--line);
+    display: flex; align-items: center; justify-content: space-between;
+    font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--mute);
+  }
+  .panel-b { padding: 14px 16px; }
+
+  .row-2 { display: grid; grid-template-columns: 1.3fr .7fr; gap: 16px; }
+  @media (max-width: 900px) { .row-2 { grid-template-columns: 1fr; } .grid-stats { grid-template-columns: repeat(2, 1fr); } }
+
+  canvas#capitaleChart { max-height: 220px; }
+
+  table { width: 100%; border-collapse: collapse; font-size: 12px; }
+  th { text-align: left; color: var(--mute); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--line); text-transform: uppercase; font-size: 10px; letter-spacing: .05em; }
+  td { padding: 7px 8px; border-bottom: 1px solid var(--line); }
+  tr:last-child td { border-bottom: none; }
+  .pos { color: var(--green); }
+  .neg { color: var(--red); }
+
+  .badge { display: inline-block; padding: 2px 8px; border-radius: 20px; font-size: 10px; font-weight: 600; letter-spacing: .04em; }
+  .badge.euforia { background: rgba(245,165,36,.15); color: var(--amber); }
+  .badge.normale { background: rgba(20,241,149,.15); color: var(--green); }
+  .badge.cautela { background: rgba(245,165,36,.15); color: var(--amber); }
+  .badge.panico  { background: rgba(239,68,68,.15); color: var(--red); }
+  .badge.sconosciuto { background: rgba(139,133,163,.15); color: var(--mute); }
+
+  .empty { color: var(--mute); font-style: italic; padding: 20px; text-align: center; }
+
+  .log-box {
+    background: #050409; font-size: 11px; line-height: 1.6; padding: 12px 14px;
+    max-height: 280px; overflow-y: auto; color: #9c96b5; white-space: pre-wrap; word-break: break-word;
+  }
+  .report-md { font-size: 12px; line-height: 1.7; white-space: pre-wrap; color: var(--ink); }
+  .report-md strong { color: var(--green); }
+
+  .chip-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .chip { background: var(--panel-2); border: 1px solid var(--line); border-radius: 20px; padding: 4px 10px; font-size: 11px; color: var(--mute); }
+</style>
+</head>
+<body>
+
+<header>
+  <span class="dot" id="liveDot"></span>
+  <h1>Memecoin Bot</h1>
+  <span class="sub" id="regimeBadgeSlot"></span>
+  <span class="clock" id="clock">—</span>
+</header>
+
+<div class="wrap">
+
+  <div class="grid-stats">
+    <div class="stat"><div class="label">Capitale</div><div class="value" id="stCapitale">—</div></div>
+    <div class="stat"><div class="label">Posizioni aperte</div><div class="value" id="stAperte">—</div></div>
+    <div class="stat"><div class="label">Trade chiusi</div><div class="value" id="stChiusi">—</div></div>
+    <div class="stat"><div class="label">Win rate</div><div class="value" id="stWinrate">—</div></div>
+    <div class="stat"><div class="label">PnL totale</div><div class="value" id="stPnl">—</div></div>
+  </div>
+
+  <div class="row-2">
+    <div>
+      <div class="panel">
+        <div class="panel-h"><span>Andamento capitale</span></div>
+        <div class="panel-b"><canvas id="capitaleChart" height="70"></canvas></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-h"><span>Posizioni aperte</span></div>
+        <div class="panel-b" id="posizioniBox"><div class="empty">Nessuna posizione aperta</div></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-h"><span>Trade recenti</span></div>
+        <div class="panel-b" id="tradesBox"><div class="empty">Nessun trade chiuso ancora</div></div>
+      </div>
+    </div>
+
+    <div>
+      <div class="panel">
+        <div class="panel-h"><span>Report supervisore</span><span id="reportTs"></span></div>
+        <div class="panel-b report-md" id="reportBox"><div class="empty">Nessun report ancora (primo run dopo 6h)</div></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-h"><span>Motivi di uscita</span></div>
+        <div class="panel-b"><div class="chip-row" id="motiviBox"><span class="empty">—</span></div></div>
+      </div>
+
+      <div class="panel">
+        <div class="panel-h"><span>Log recente</span></div>
+        <div class="log-box" id="logBox">In attesa di dati…</div>
+      </div>
+    </div>
+  </div>
+
+</div>
+
+<script>
+let chart = null;
+const capitaleStoria = [];
+
+function fmtEur(v) {
+  if (v === null || v === undefined) return '—';
+  const s = v >= 0 ? '+' : '';
+  return s + v.toFixed(2) + '€';
+}
+
+function badgeClass(regime) {
+  return { EUFORIA: 'euforia', NORMALE: 'normale', CAUTELA: 'cautela', PANICO: 'panico' }[regime] || 'sconosciuto';
+}
+
+function renderRegime(r) {
+  const regime = (r && r.regime) || 'SCONOSCIUTO';
+  document.getElementById('regimeBadgeSlot').innerHTML =
+    `<span class="badge ${badgeClass(regime)}">${regime}${r.score != null ? ' · ' + r.score : ''}</span>`;
+}
+
+function renderStato(d) {
+  document.getElementById('stCapitale').textContent = d.capitale_eur != null ? d.capitale_eur.toFixed(2) + '€' : '—';
+  document.getElementById('stAperte').textContent = d.n_posizioni;
+  document.getElementById('stChiusi').textContent = d.n_trade;
+
+  const wr = document.getElementById('stWinrate');
+  wr.textContent = d.win_rate != null ? d.win_rate + '%' : '—';
+  wr.className = 'value ' + (d.win_rate != null ? (d.win_rate >= 45 ? 'green' : d.win_rate >= 30 ? 'amber' : 'red') : '');
+
+  const pnl = document.getElementById('stPnl');
+  pnl.textContent = fmtEur(d.pnl_totale_eur);
+  pnl.className = 'value ' + (d.pnl_totale_eur >= 0 ? 'green' : 'red');
+
+  // Posizioni
+  const posEntries = Object.entries(d.posizioni || {});
+  const posBox = document.getElementById('posizioniBox');
+  if (posEntries.length === 0) {
+    posBox.innerHTML = '<div class="empty">Nessuna posizione aperta</div>';
+  } else {
+    let html = '<table><tr><th>Token</th><th>Entrata</th><th>Investito</th><th>Tier raggiunti</th><th>Minuti</th></tr>';
+    posEntries.forEach(([mint, p]) => {
+      html += `<tr><td>${p.symbol}</td><td>$${Number(p.prezzo_entrata).toFixed(8)}</td><td>${p.sol_investiti} SOL</td><td>${(p.tiers_eseguiti||[]).join(', ') || '—'}</td><td>${Math.round((p.minuti_aperta)||0)}</td></tr>`;
+    });
+    html += '</table>';
+    posBox.innerHTML = html;
+  }
+
+  // Trade recenti
+  const tradesBox = document.getElementById('tradesBox');
+  if (!d.trades_recenti || d.trades_recenti.length === 0) {
+    tradesBox.innerHTML = '<div class="empty">Nessun trade chiuso ancora</div>';
+  } else {
+    let html = '<table><tr><th>Token</th><th>Motivo</th><th>PnL</th><th>Minuti</th></tr>';
+    d.trades_recenti.forEach(t => {
+      const cls = t.pnl_eur >= 0 ? 'pos' : 'neg';
+      html += `<tr><td>${t.symbol}</td><td>${t.motivo}</td><td class="${cls}">${fmtEur(t.pnl_eur)}</td><td>${t.minuti != null ? Math.round(t.minuti) : '—'}</td></tr>`;
+    });
+    html += '</table>';
+    tradesBox.innerHTML = html;
+  }
+
+  // Motivi uscita
+  const motiviBox = document.getElementById('motiviBox');
+  const motivi = Object.entries(d.motivi_uscita || {});
+  motiviBox.innerHTML = motivi.length
+    ? motivi.map(([m, n]) => `<span class="chip">${m}: ${n}</span>`).join('')
+    : '<span class="empty">—</span>';
+
+  // Report agente
+  const reportBox = document.getElementById('reportBox');
+  const reportTs = document.getElementById('reportTs');
+  if (d.report_agente && d.report_agente.disponibile) {
+    reportTs.textContent = d.report_agente.timestamp || '';
+    let md = d.report_agente.markdown
+      .replace(/^# .+$/m, '')
+      .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+      .replace(/^## (.+)$/gm, '<br><strong>$1</strong>');
+    reportBox.innerHTML = md;
+  } else {
+    reportTs.textContent = '';
+    reportBox.innerHTML = '<div class="empty">Nessun report ancora (primo run dopo 6h)</div>';
+  }
+
+  // Log
+  const logBox = document.getElementById('logBox');
+  if (d.log_recente && d.log_recente.length) {
+    logBox.textContent = d.log_recente.join('\n');
+    logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  // Regime
+  renderRegime(d.regime);
+
+  // Chart
+  if (d.capitale_eur != null) {
+    capitaleStoria.push({ t: new Date().toLocaleTimeString('it-IT'), v: d.capitale_eur });
+    if (capitaleStoria.length > 60) capitaleStoria.shift();
+    aggiornaChart();
+  }
+}
+
+function aggiornaChart() {
+  const labels = capitaleStoria.map(p => p.t);
+  const data = capitaleStoria.map(p => p.v);
+  if (!chart) {
+    const ctx = document.getElementById('capitaleChart').getContext('2d');
+    chart = new Chart(ctx, {
+      type: 'line',
+      data: { labels, datasets: [{
+        data, borderColor: '#9945ff', backgroundColor: 'rgba(153,69,255,0.08)',
+        borderWidth: 2, pointRadius: 0, tension: 0.25, fill: true,
+      }]},
+      options: {
+        responsive: true, maintainAspectRatio: false,
+        plugins: { legend: { display: false } },
+        scales: {
+          x: { ticks: { color: '#8b85a3', font: { size: 10 } }, grid: { color: '#1f1b2b' } },
+          y: { ticks: { color: '#8b85a3', font: { size: 10 } }, grid: { color: '#1f1b2b' } },
+        },
+      },
+    });
+  } else {
+    chart.data.labels = labels;
+    chart.data.datasets[0].data = data;
+    chart.update('none');
+  }
+}
+
+async function poll() {
+  try {
+    const r = await fetch('/api/stato');
+    const d = await r.json();
+    renderStato(d);
+    document.getElementById('liveDot').style.background = '#14f195';
+  } catch (e) {
+    document.getElementById('liveDot').style.background = '#ef4444';
+  }
+}
+
+function tickClock() {
+  document.getElementById('clock').textContent = new Date().toLocaleTimeString('it-IT');
+}
+
+poll();
+setInterval(poll, 10000);
+setInterval(tickClock, 1000);
+tickClock();
+</script>
+
+</body>
+</html>
