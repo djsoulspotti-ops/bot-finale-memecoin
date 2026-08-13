@@ -30,6 +30,32 @@ cp .env.example .env    # poi compila le chiavi
 python main.py          # parte in PAPER MODE
 ```
 
+## Controllo manuale: start / pausa / stop
+```bash
+python control.py start   # operazioni normali (nuovi ingressi + monitoraggio)
+python control.py pausa   # nessun nuovo ingresso, le posizioni aperte restano protette
+python control.py stop    # tutto fermo, incluso il monitoraggio (posizioni non più protette)
+python control.py stato   # mostra il comando attivo
+```
+Il bot legge `control.json` ad ogni ciclo: non serve riavviare il processo.
+Su Railway, lancia questi comandi dalla tab **Console** del servizio.
+
+## Protezioni anti-perdita di capitale
+- **Conferma on-chain reale**: ogni transazione live viene attesa fino a conferma
+  (`confirmed`/`finalized`) prima di essere considerata riuscita; l'importo
+  ricevuto/speso viene letto dai balance pre/post della transazione, mai dalla
+  quote preventivata.
+- **Controllo saldo pre-trade**: prima di ogni acquisto il bot verifica il saldo
+  SOL reale del wallet (non il file di stato interno) e rifiuta il trade se
+  insufficiente.
+- **Contabilità basata sull'eseguito reale**: le vendite a tranche aggiornano la
+  posizione solo in base a ciò che è stato davvero venduto e confermato — se una
+  tranche fallisce a metà, il residuo resta tracciato e riprovato, mai perso.
+- **Stop di sicurezza indipendente**: se il saldo SOL reale del wallet scende
+  sotto `floor_sicurezza_pct` (default 30%) del capitale iniziale, il bot si
+  mette in pausa da solo, indipendentemente da cosa dice la contabilità interna.
+  Riparte solo con `python control.py start`.
+
 ## Deploy h24 su VPS (systemd)
 Vedi il documento di architettura per il file `memecoin-bot.service` completo.
 

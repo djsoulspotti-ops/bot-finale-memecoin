@@ -25,6 +25,12 @@ class APIConfig:
     # Wallet (chiave privata in base58 — TENERE SOLO IN .env)
     wallet_private_key: str = os.getenv("WALLET_PRIVATE_KEY", "")
 
+    # Telegram — notifiche + comandi PARTI/PAUSA/STOP (opzionale: se mancano
+    # queste due, l'integrazione resta disattivata senza rompere il bot).
+    # Setup: vedi l'intestazione di telegram_bot.py.
+    telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
+    telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
+
     # Jito Block Engine (ingresso prioritario, alternativa reale a Photon
     # dato che Photon non espone API per bot — vedi commento in executor.py)
     jito_block_engine_url: str = "https://mainnet.block-engine.jito.wtf/api/v1/bundles"
@@ -92,6 +98,16 @@ class RiskConfig:
     # Circuit breaker giornaliero
     max_perdita_giornaliera_pct: float = 0.20  # -20% in un giorno → bot in pausa 24h
 
+    # ---- STOP DI SICUREZZA SU SALDO REALE (backstop indipendente) ----
+    # A differenza del circuit breaker sopra (basato sulla contabilità INTERNA,
+    # che può sbagliare in caso di bug o vendite parziali), questo controllo
+    # legge il saldo SOL REALE del wallet on-chain ad ogni ciclo. Se scende
+    # sotto questa percentuale del capitale iniziale, il bot si ferma da solo
+    # e resta fermo finché l'utente non lo riavvia esplicitamente con
+    # "python control.py start" — è l'ultima linea di difesa contro qualunque
+    # bug di contabilità o perdita più rapida del previsto.
+    floor_sicurezza_pct: float = 0.30
+
     # Slippage massimo accettato (in basis points, 300 = 3%)
     slippage_bps: int = 300
 
@@ -148,6 +164,15 @@ class BotConfig:
 
     # Intervallo di scansione nuovi pool (secondi)
     scan_interval_sec: int = 20
+
+    # Quanti candidati valutare IN PARALLELO ad ogni ciclo (filtri + sentiment +
+    # Claude). Con valutazione sequenziale, il tempo reale di un ciclo può
+    # superare ampiamente scan_interval_sec quando arrivano molti candidati
+    # insieme (il sentiment/regime usano web_search, timeout fino a 90s).
+    max_candidati_paralleli: int = 5
+
+    # File di controllo manuale (start/pausa/stop), letto ad ogni ciclo.
+    file_controllo: str = "control.json"
 
     # Usa Claude per l'analisi qualitativa (consigliato)
     usa_analisi_claude: bool = True

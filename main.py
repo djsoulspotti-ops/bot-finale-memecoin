@@ -3,10 +3,28 @@ main.py — Orchestratore del bot. Loop principale h24.
 
 Pipeline per ogni ciclo (~20 secondi):
   1. SCAN     → scanner.py trova nuovi pool
-  2. FILTER   → filters.py applica i filtri anti-rug
-  3. ANALYZE  → claude_analyzer.py chiede a Claude uno score 0-100
-  4. EXECUTE  → executor.py compra via Jupiter (se score >= soglia)
-  5. MONITOR  → risk_manager.py controlla SL/TP/trailing su ogni posizione
+  2. FILTER   → filters.py applica i filtri anti-rug       ┐ eseguiti in
+  3. SENTIMENT→ sentiment.py valuta il sentiment social     ┘ parallelo tra loro
+  4. ANALYZE  → claude_analyzer.py chiede a Claude uno score 0-100
+  5. EXECUTE  → executor.py compra via Jupiter (se score >= soglia)
+  6. MONITOR  → risk_manager.py controlla SL/TP/trailing su ogni posizione
+
+I candidati di ogni ciclo vengono valutati IN PARALLELO (fino a
+CONFIG.max_candidati_paralleli insieme) invece che uno alla volta: con
+sentiment/regime che usano web_search (timeout fino a 90s), la valutazione
+sequenziale poteva far scivolare il ciclo reale ben oltre i 20s nominali.
+
+Controllo manuale — vedi control.py:
+  python control.py start | pausa | stop
+Il bot legge control.json ad ogni ciclo:
+  - run:   normale (ingressi + monitoraggio)
+  - pausa: nessun nuovo ingresso, monitoraggio/protezione posizioni ATTIVI
+  - stop:  tutto fermo, incluso il monitoraggio (posizioni non più protette)
+
+Stop di sicurezza automatico: se il saldo SOL reale del wallet scende sotto
+CONFIG.risk.floor_sicurezza_pct del capitale iniziale, il bot si mette in
+pausa indefinita da solo (indipendentemente da cosa dice la contabilità
+interna) finché non arriva un "python control.py start" esplicito.
 
 Avvio:   python main.py
 Il bot parte in PAPER MODE (simulazione). Per il live: BOT_MODE=live in .env
@@ -30,6 +48,7 @@ from market_sentiment import MarketSentiment
 from risk_manager import Posizione, RiskManager
 from scanner import PoolScanner
 from sentiment import SentimentAnalyzer
+from telegram_bot import TelegramNotifier
 from timing import momentum_score, score_composito
 
 logging.basicConfig(
@@ -38,6 +57,15 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout), logging.FileHandler("bot.log")],
 )
 log = logging.getLogger("main")
+
+
+def leggi_comando_controllo() -> str:
+    """Legge control.json (scritto da control.py). Default 'run' se assente/corrotto."""
+    try:
+        with open(CONFIG.file_controllo) as f:
+            return json.load(f).get("comando", "run")
+    except (FileNotFoundError, json.JSONDecodeError):
+        return "run"
 
 
 class MemecoinBot:
@@ -52,13 +80,52 @@ class MemecoinBot:
         self.risk = RiskManager()
         self.risk.carica_stato()
         self.agente = AgentSupervisor(session, self.risk)
+        self.telegram = TelegramNotifier(session)
         self.session = session
         self.prezzo_sol_eur = 0.0
         # Clustering: buffer di candidati (candidato, score_composito, ts)
         self.cluster: list[tuple] = []
         self.cluster_apertura_ts = 0.0
+        self._sem_candidati = asyncio.Semaphore(CONFIG.max_candidati_paralleli)
 
     # ---------------- CICLO DI INGRESSO ----------------
+
+    async def _valuta_candidato(self, c, mod: dict, regime_data: dict) -> tuple | None:
+        """Valuta un singolo candidato. Ritorna None se scartato, altrimenti
+        la tupla da mettere nel cluster. Filtro e sentiment sono indipendenti
+        tra loro (nessuno dei due dipende dall'output dell'altro): li lancio
+        in parallelo per dimezzare la latenza di rete di questo stadio."""
+        async with self._sem_candidati:
+            mom = momentum_score(c)
+            soglia_momentum = CONFIG.filters.min_momentum_score + mod["min_momentum_extra"]
+            if mom < soglia_momentum:
+                log.debug("Momentum insufficiente per %s: %.0f (soglia %.0f, regime %s)",
+                         c.symbol, mom, soglia_momentum, regime_data.get("regime"))
+                return None
+
+            fr, sent = await asyncio.gather(self.filtro.valuta(c), self.sentiment.analizza(c))
+
+            if not fr.passed:
+                return None
+
+            if sent.get("sentiment_score", 0) < CONFIG.filters.min_sentiment_score:
+                log.info("Sentiment insufficiente per %s: %s (%s)", c.symbol,
+                         sent.get("sentiment_score"), sent.get("hype_type"))
+                return None
+            if CONFIG.filters.scarta_se_shill and sent.get("hype_type") == "shill":
+                log.info("Shill coordinato rilevato su %s → scarto", c.symbol)
+                return None
+
+            analisi = {"score": 75}
+            if CONFIG.usa_analisi_claude:
+                analisi = await self.claude.analizza(c, fr)
+                if analisi.get("decisione") != "COMPRA" or analisi.get("score", 0) < CONFIG.min_claude_score:
+                    log.info("Claude scarta %s: %s", c.symbol, analisi.get("motivazione"))
+                    return None
+
+            comp = score_composito(analisi.get("score", 0), sent.get("sentiment_score", 0), mom)
+            log.info("🧺 %s valutato con score composito %.0f", c.symbol, comp)
+            return (c, comp, analisi.get("score", 0), sent.get("sentiment_score", 0), mom)
 
     async def ciclo_ingresso(self):
         import time as _t
@@ -77,44 +144,15 @@ class MemecoinBot:
             pass
 
         candidati = await self.scanner.scansiona_nuovi_pool()
-        for c in candidati:
-            # Gate momentum (gratis, prima di tutto: taglia i token morti subito)
-            mom = momentum_score(c)
-            soglia_momentum = CONFIG.filters.min_momentum_score + mod["min_momentum_extra"]
-            if mom < soglia_momentum:
-                log.debug("Momentum insufficiente per %s: %.0f (soglia %.0f, regime %s)",
-                         c.symbol, mom, soglia_momentum, regime_data.get("regime"))
-                continue
 
-            # Filtri hard
-            fr = await self.filtro.valuta(c)
-            if not fr.passed:
-                continue
-
-            # Gate sentiment social
-            sent = await self.sentiment.analizza(c)
-            if sent.get("sentiment_score", 0) < CONFIG.filters.min_sentiment_score:
-                log.info("Sentiment insufficiente per %s: %s (%s)", c.symbol,
-                         sent.get("sentiment_score"), sent.get("hype_type"))
-                continue
-            if CONFIG.filters.scarta_se_shill and sent.get("hype_type") == "shill":
-                log.info("Shill coordinato rilevato su %s → scarto", c.symbol)
-                continue
-
-            # Analisi Claude
-            analisi = {"score": 75}
-            if CONFIG.usa_analisi_claude:
-                analisi = await self.claude.analizza(c, fr)
-                if analisi.get("decisione") != "COMPRA" or analisi.get("score", 0) < CONFIG.min_claude_score:
-                    log.info("Claude scarta %s: %s", c.symbol, analisi.get("motivazione"))
-                    continue
-
-            # Nel CLUSTER, non compra subito: aspetta la finestra e prendi i migliori
-            comp = score_composito(analisi.get("score", 0), sent.get("sentiment_score", 0), mom)
-            if not self.cluster:
-                self.cluster_apertura_ts = _t.time()
-            self.cluster.append((c, comp, analisi.get("score", 0), sent.get("sentiment_score", 0), mom))
-            log.info("🧺 %s in cluster con score composito %.0f (%d nel buffer)", c.symbol, comp, len(self.cluster))
+        # Valutazione IN PARALLELO (limitata da max_candidati_paralleli) invece
+        # che uno alla volta: riduce di molto il tempo reale del ciclo quando
+        # arrivano più candidati insieme nello stesso scan.
+        risultati = await asyncio.gather(*[self._valuta_candidato(c, mod, regime_data) for c in candidati])
+        nuovi = [r for r in risultati if r is not None]
+        if nuovi and not self.cluster:
+            self.cluster_apertura_ts = _t.time()
+        self.cluster.extend(nuovi)
 
         # Finestra cluster scaduta → compra i top N (modulati dal regime di mercato)
         if self.cluster and _t.time() - self.cluster_apertura_ts >= CONFIG.risk.cluster_buffer_min * 60:
@@ -166,6 +204,8 @@ class MemecoinBot:
         res = await self.executor.compra(c.mint, sol_amount)
         if not res.ok:
             log.error("Acquisto %s fallito: %s", c.symbol, res.errore)
+            if CONFIG.mode == "live":
+                await self.telegram.invia(f"⚠️ Acquisto <b>{c.symbol}</b> fallito: {res.errore}")
             return
 
         qty = int(res.output_amount)
@@ -181,41 +221,121 @@ class MemecoinBot:
             score_composito=score_composito,
             regime_entrata=regime,
         ))
+        riga_score = f"\nScore composito: {score_composito:.0f}" if score_composito is not None else ""
+        await self.telegram.invia(
+            f"📈 Aperta posizione <b>{c.symbol}</b>\n"
+            f"Prezzo: ${c.price_usd:.8f}\n"
+            f"Investiti: {sol_amount:.4f} SOL (≈{size_eur:.2f}€){riga_score}"
+        )
 
     # ---------------- CICLO DI MONITORAGGIO ----------------
 
     async def ciclo_monitoraggio(self):
-        for mint in list(self.risk.posizioni.keys()):
-            snap = await self.market.snapshot(mint)
-            if not snap:
-                continue
-            prezzo = float(snap.get("priceUsd") or 0)
-            change5m = float((snap.get("priceChange") or {}).get("m5") or 0)
-            if prezzo <= 0:
-                continue
-            azione, frazione = self.risk.decisione_uscita(mint, prezzo, change5m)
-            if azione == "HOLD":
-                continue
+        mints = list(self.risk.posizioni.keys())
+        # Al massimo 3 posizioni contemporanee (config): il parallelismo qui
+        # non è critico per il volume, ma evita che una posizione lenta a
+        # rispondere (rete, RPC) ritardi il controllo delle altre.
+        await asyncio.gather(*[self._gestisci_posizione(mint) for mint in mints])
 
-            pos = self.risk.posizioni[mint]
-            qty = int(pos.quantita_raw * frazione)
+    async def _gestisci_posizione(self, mint: str):
+        snap = await self.market.snapshot(mint)
+        if not snap:
+            return
+        prezzo = float(snap.get("priceUsd") or 0)
+        change5m = float((snap.get("priceChange") or {}).get("m5") or 0)
+        if prezzo <= 0:
+            return
+        azione, frazione_richiesta = self.risk.decisione_uscita(mint, prezzo, change5m)
+        if azione == "HOLD":
+            return
+
+        pos = self.risk.posizioni.get(mint)
+        if not pos:
+            return
+        residuo_prima = pos.quantita_raw
+        qty = int(residuo_prima * frazione_richiesta)
+
+        # Stop loss = urgenza: vendita secca immediata, niente tranches.
+        # Ladder/trailing/time exit = vendita parzializzata calm-aware.
+        urgente = pos.pnl_pct(prezzo) <= CONFIG.risk.stop_loss_pct
+        if urgente:
+            res = await self.executor.vendi(mint, qty)
+        else:
             size_usd = qty / max(pos.quantita_iniziale_raw, 1) * pos.sol_investiti * self.prezzo_sol_eur / 0.93
+            res = await self.executor.vendi_tranches(mint, qty, self.market, size_usd)
 
-            # Stop loss = urgenza: vendita secca immediata, niente tranches.
-            # Ladder/trailing/time exit = vendita parzializzata calm-aware.
-            urgente = self.risk.posizioni[mint].pnl_pct(prezzo) <= CONFIG.risk.stop_loss_pct
-            if urgente:
-                res = await self.executor.vendi(mint, qty)
-            else:
-                res = await self.executor.vendi_tranches(mint, qty, self.market, size_usd)
-            if res.ok:
-                pnl_pct = pos.pnl_pct(prezzo)
-                valore_venduto_eur = pos.sol_investiti * frazione * self.prezzo_sol_eur
-                pnl_eur = valore_venduto_eur * pnl_pct
-                motivo = "stop_loss" if urgente else ("ladder" if pos.tiers_eseguiti else "trailing_o_time")
-                self.risk.chiudi(mint, pnl_eur, frazione, motivo=motivo)
-            else:
+        # ---- Contabilità basata SOLO su ciò che è stato realmente venduto ----
+        # `res.unita_vendute_raw` riflette l'esecuzione reale (confermata
+        # on-chain), non la frazione richiesta: se una tranche fallisce a metà
+        # strada, qui si aggiorna la posizione solo per la parte davvero
+        # venduta — niente più posizioni "chiuse sulla carta" con token reali
+        # dimenticati nel wallet.
+        venduto_raw = res.unita_vendute_raw
+        if venduto_raw <= 0:
+            if not res.ok:
                 log.error("Vendita %s fallita: %s — riprovo al prossimo ciclo", pos.symbol, res.errore)
+            return
+
+        frazione_reale = min(1.0, venduto_raw / max(residuo_prima, 1))
+        pnl_pct = pos.pnl_pct(prezzo)
+        valore_venduto_eur = pos.sol_investiti * frazione_reale * self.prezzo_sol_eur
+        pnl_eur = valore_venduto_eur * pnl_pct
+        motivo = "stop_loss" if urgente else ("ladder" if pos.tiers_eseguiti else "trailing_o_time")
+        breaker_scattato = self.risk.chiudi(mint, pnl_eur, frazione_reale, motivo=motivo)
+
+        emoji = "🟢" if pnl_eur >= 0 else "🔴"
+        await self.telegram.invia(
+            f"{emoji} Chiusa posizione <b>{pos.symbol}</b> ({motivo})\n"
+            f"PnL: {pnl_eur:+.2f}€ ({pnl_pct * 100:+.0f}%)\n"
+            f"Frazione venduta: {frazione_reale * 100:.0f}%\n"
+            f"Capitale tracciato: {self.risk.capitale_eur:.2f}€"
+        )
+
+        if frazione_reale < 0.999:
+            log.warning(
+                "⚠️ Vendita parziale su %s: venduto %.0f%% di quanto richiesto (%s). "
+                "Il residuo resta in posizione e verrà ritentato al prossimo ciclo.",
+                pos.symbol, frazione_reale * 100, res.errore or "tranche incompleta",
+            )
+            await self.telegram.invia(
+                f"⚠️ Vendita parziale su <b>{pos.symbol}</b>: venduto solo {frazione_reale * 100:.0f}% "
+                f"del richiesto. Il residuo resta protetto e verrà ritentato."
+            )
+
+        if breaker_scattato:
+            await self.telegram.invia(
+                f"🚨 <b>CIRCUIT BREAKER GIORNALIERO</b>: perdita giornaliera {self.risk.pnl_giornaliero_eur:+.2f}€ "
+                f"→ bot in pausa per 24h. Nessun nuovo ingresso, le posizioni restano protette."
+            )
+
+    # ---------------- STOP DI SICUREZZA (saldo reale on-chain) ----------------
+
+    async def controllo_sicurezza_saldo(self):
+        """Backstop indipendente dalla contabilità interna: se il saldo SOL
+        REALE del wallet scende sotto floor_sicurezza_pct del capitale
+        iniziale, forza una pausa indefinita a prescindere da cosa dice
+        stato_bot.json. Serve a coprire bug di contabilità non ancora noti,
+        non solo quelli già corretti."""
+        if CONFIG.mode != "live" or self.prezzo_sol_eur <= 0:
+            return
+        saldo_sol = await self.executor.saldo_sol()
+        saldo_eur = saldo_sol * self.prezzo_sol_eur
+        floor_eur = CONFIG.risk.capitale_iniziale_eur * CONFIG.risk.floor_sicurezza_pct
+        if saldo_eur < floor_eur:
+            if self.risk.forza_pausa_sicurezza():
+                log.critical(
+                    "🚨 STOP DI SICUREZZA: saldo reale wallet ≈%.2f€ (%.4f SOL) sotto la soglia "
+                    "minima %.2f€ (%.0f%% del capitale iniziale). Bot in pausa automatica — "
+                    "nessuna nuova apertura finché non lanci 'python control.py start'.",
+                    saldo_eur, saldo_sol, floor_eur, CONFIG.risk.floor_sicurezza_pct * 100,
+                )
+                await self.telegram.invia(
+                    f"🚨 <b>STOP DI SICUREZZA</b>\n"
+                    f"Saldo reale wallet ≈{saldo_eur:.2f}€ ({saldo_sol:.4f} SOL), sotto la soglia minima "
+                    f"{floor_eur:.2f}€ ({CONFIG.risk.floor_sicurezza_pct * 100:.0f}% del capitale iniziale).\n"
+                    f"Bot in pausa automatica — nessun nuovo ingresso.\n"
+                    f"Manda PARTI quando hai verificato la situazione."
+                )
 
     async def _prezzo_corrente(self, mint: str) -> float | None:
         url = f"{CONFIG.api.dexscreener_url}/tokens/v1/solana/{mint}"
@@ -261,10 +381,44 @@ class MemecoinBot:
         log.info("🚀 Bot avviato | modalità=%s | capitale=%.2f EUR", CONFIG.mode.upper(), self.risk.capitale_eur)
         if CONFIG.mode == "live":
             log.warning("⚠️  MODALITÀ LIVE: soldi veri a rischio!")
+        asyncio.create_task(self.telegram.poll_comandi())
+        await self.telegram.invia(
+            f"🚀 Bot avviato | modalità={CONFIG.mode.upper()} | capitale tracciato={self.risk.capitale_eur:.2f}€\n"
+            f"Comandi: PARTI, PAUSA, STOP, STATO."
+        )
+        ultimo_comando_loggato = None
         while True:
             try:
-                await asyncio.gather(self.ciclo_ingresso(), self.ciclo_monitoraggio())
-                await self.agente.forse_esegui()   # supervisore agentico: ogni 6h
+                comando = leggi_comando_controllo()
+
+                # Un comando "start" esplicito è l'unico modo per rimuovere lo
+                # STOP DI SICUREZZA (pausa indefinita) — l'utente riconosce
+                # così il problema prima di far ripartire il bot.
+                if comando == "run" and self.risk.in_pausa_fino == float("inf"):
+                    self.risk.in_pausa_fino = 0.0
+                    log.warning("▶️ Stop di sicurezza rimosso manualmente (comando 'start').")
+
+                if comando != ultimo_comando_loggato:
+                    # La conferma via Telegram (se il comando arriva da lì) la manda
+                    # già _gestisci_messaggio(): qui basta il log, per non duplicare
+                    # il messaggio in chat.
+                    log.warning("🎛️ Comando attivo: %s", comando.upper())
+                    ultimo_comando_loggato = comando
+
+                if comando == "stop":
+                    # Tutto fermo, incluso il monitoraggio: nessuna azione automatica.
+                    await asyncio.sleep(CONFIG.scan_interval_sec)
+                    continue
+
+                await self._aggiorna_prezzo_sol()
+                await self.controllo_sicurezza_saldo()
+
+                if comando == "pausa":
+                    # Nessun nuovo ingresso, ma le posizioni aperte restano protette.
+                    await self.ciclo_monitoraggio()
+                else:
+                    await asyncio.gather(self.ciclo_ingresso(), self.ciclo_monitoraggio())
+                    await self.agente.forse_esegui()   # supervisore agentico: ogni 6h
             except Exception as e:
                 log.exception("Errore nel ciclo principale: %s", e)
             await asyncio.sleep(CONFIG.scan_interval_sec)

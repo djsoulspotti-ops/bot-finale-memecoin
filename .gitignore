@@ -1,0 +1,21 @@
+# Segreti — MAI committare
+.env
+
+# Stato/log generati a runtime dal bot: locali al deploy, non fanno parte del codice
+control.json
+stato_bot.json
+trade_chiusi.jsonl
+paper_trades.jsonl
+agent_log.jsonl
+report_agente.md
+ultimo_regime.json
+bot.log
+
+# Python
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# OS
+.DS_Store

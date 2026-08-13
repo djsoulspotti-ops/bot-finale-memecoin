@@ -62,12 +62,24 @@ class RiskManager:
 
     def puo_aprire(self) -> tuple[bool, str]:
         self._reset_giornaliero()
+        if self.in_pausa_fino == float("inf"):
+            return False, "STOP DI SICUREZZA attivo (saldo reale sotto soglia) — richiede 'python control.py start'"
         if time.time() < self.in_pausa_fino:
             ore = (self.in_pausa_fino - time.time()) / 3600
             return False, f"circuit breaker attivo per altre {ore:.1f}h"
         if len(self.posizioni) >= self.r.max_posizioni_aperte:
             return False, f"già {len(self.posizioni)} posizioni aperte (max)"
         return True, "ok"
+
+    def forza_pausa_sicurezza(self) -> bool:
+        """Pausa INDEFINITA forzata da un controllo esterno (saldo wallet reale
+        sotto la soglia di sicurezza). A differenza del circuit breaker
+        giornaliero (si riapre da solo dopo 24h), questa richiede un reset
+        manuale esplicito dell'utente. Ritorna True solo al primo trigger
+        (per non spammare il log ad ogni ciclo)."""
+        era_gia_attiva = self.in_pausa_fino == float("inf")
+        self.in_pausa_fino = float("inf")
+        return not era_gia_attiva
 
     def size_posizione_eur(self, score_composito: float | None = None) -> float:
         """
@@ -153,10 +165,12 @@ class RiskManager:
 
         return "HOLD", 0.0
 
-    def chiudi(self, mint: str, pnl_eur: float, frazione: float = 1.0, motivo: str = "?"):
+    def chiudi(self, mint: str, pnl_eur: float, frazione: float = 1.0, motivo: str = "?") -> bool:
+        """Ritorna True se questa chiusura ha fatto scattare il circuit breaker
+        giornaliero (utile al chiamante per mandare un alert immediato)."""
         pos = self.posizioni.get(mint)
         if not pos:
-            return
+            return False
         self.capitale_eur += pnl_eur
         self.pnl_giornaliero_eur += pnl_eur
         with open("trade_chiusi.jsonl", "a") as f:
@@ -180,10 +194,13 @@ class RiskManager:
 
         # Circuit breaker
         soglia = -self.r.capitale_iniziale_eur * self.r.max_perdita_giornaliera_pct
-        if self.pnl_giornaliero_eur <= soglia:
+        breaker_scattato = False
+        if self.pnl_giornaliero_eur <= soglia and self.in_pausa_fino != float("inf"):
             self.in_pausa_fino = time.time() + 24 * 3600
+            breaker_scattato = True
             log.warning("🚨 CIRCUIT BREAKER: perdita giornaliera %.2f EUR → pausa 24h", self.pnl_giornaliero_eur)
         self._salva_stato()
+        return breaker_scattato
 
     # ---------- PERSISTENZA ----------
 
