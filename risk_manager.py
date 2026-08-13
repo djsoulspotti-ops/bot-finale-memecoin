@@ -54,6 +54,12 @@ class RiskManager:
         self.r = CONFIG.risk
         self.posizioni: dict[str, Posizione] = {}
         self.capitale_eur = self.r.capitale_iniziale_eur
+        # Baseline REALE usata per circuit breaker e stop di sicurezza — parte
+        # dal default di config.py, ma viene sovrascritta con il saldo VERO del
+        # wallet al primo avvio live (vedi imposta_capitale_iniziale_reale):
+        # le soglie in percentuale devono ancorarsi ai soldi che ci sono
+        # davvero, non a un numero fisso lasciato nel codice.
+        self.capitale_iniziale_eur_effettivo = self.r.capitale_iniziale_eur
         self.pnl_giornaliero_eur = 0.0
         self.giorno_corrente = time.strftime("%Y-%m-%d")
         self.in_pausa_fino: float = 0.0
@@ -70,6 +76,18 @@ class RiskManager:
         if len(self.posizioni) >= self.r.max_posizioni_aperte:
             return False, f"già {len(self.posizioni)} posizioni aperte (max)"
         return True, "ok"
+
+    def imposta_capitale_iniziale_reale(self, valore_eur: float):
+        """Chiamato UNA SOLA VOLTA, al primissimo avvio in modalità live (nessuno
+        stato precedente su disco), con il saldo REALE del wallet convertito in
+        EUR. Da questo momento size posizione, circuit breaker giornaliero e
+        stop di sicurezza sono ancorati al capitale VERO depositato — non al
+        default hardcoded in config.py, che potrebbe non corrispondere più a
+        quanto hai effettivamente messo nel wallet."""
+        self.capitale_iniziale_eur_effettivo = valore_eur
+        self.capitale_eur = valore_eur
+        self._salva_stato()
+        log.info("💰 Capitale iniziale ancorato al saldo reale del wallet: %.2f€", valore_eur)
 
     def forza_pausa_sicurezza(self) -> bool:
         """Pausa INDEFINITA forzata da un controllo esterno (saldo wallet reale
@@ -192,8 +210,8 @@ class RiskManager:
             pos.quantita_raw = int(pos.quantita_raw * (1 - frazione))
         log.info("💰 %s: PnL %+.2f EUR | capitale=%.2f EUR", pos.symbol, pnl_eur, self.capitale_eur)
 
-        # Circuit breaker
-        soglia = -self.r.capitale_iniziale_eur * self.r.max_perdita_giornaliera_pct
+        # Circuit breaker — ancorato al capitale REALE, non al default di config.py
+        soglia = -self.capitale_iniziale_eur_effettivo * self.r.max_perdita_giornaliera_pct
         breaker_scattato = False
         if self.pnl_giornaliero_eur <= soglia and self.in_pausa_fino != float("inf"):
             self.in_pausa_fino = time.time() + 24 * 3600
@@ -213,19 +231,28 @@ class RiskManager:
     def _salva_stato(self):
         stato = {
             "capitale_eur": self.capitale_eur,
+            "capitale_iniziale_eur_effettivo": self.capitale_iniziale_eur_effettivo,
             "pnl_giornaliero_eur": self.pnl_giornaliero_eur,
             "posizioni": {m: asdict(p) for m, p in self.posizioni.items()},
         }
         with open("stato_bot.json", "w") as f:
             json.dump(stato, f, indent=2)
 
-    def carica_stato(self):
+    def carica_stato(self) -> bool:
+        """Ritorna True se ha trovato e ripristinato uno stato precedente
+        (serve al chiamante per decidere se rilevare il capitale reale dal
+        wallet: va fatto SOLO al primissimo avvio, mai sopra uno stato già
+        esistente, altrimenti si perderebbe la contabilità accumulata)."""
         try:
             with open("stato_bot.json") as f:
                 stato = json.load(f)
             self.capitale_eur = stato.get("capitale_eur", self.capitale_eur)
+            self.capitale_iniziale_eur_effettivo = stato.get(
+                "capitale_iniziale_eur_effettivo", self.capitale_iniziale_eur_effettivo)
             for m, p in stato.get("posizioni", {}).items():
                 self.posizioni[m] = Posizione(**p)
             log.info("Stato ripristinato: capitale=%.2f EUR, %d posizioni", self.capitale_eur, len(self.posizioni))
+            return True
         except FileNotFoundError:
             log.info("Nessuno stato precedente: partenza pulita")
+            return False

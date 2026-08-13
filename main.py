@@ -78,7 +78,7 @@ class MemecoinBot:
         self.mkt_sentiment = MarketSentiment(session)
         self.executor = JupiterExecutor(session)
         self.risk = RiskManager()
-        self.risk.carica_stato()
+        self._stato_precedente_trovato = self.risk.carica_stato()
         self.agente = AgentSupervisor(session, self.risk)
         self.telegram = TelegramNotifier(session)
         self.session = session
@@ -320,7 +320,10 @@ class MemecoinBot:
             return
         saldo_sol = await self.executor.saldo_sol()
         saldo_eur = saldo_sol * self.prezzo_sol_eur
-        floor_eur = CONFIG.risk.capitale_iniziale_eur * CONFIG.risk.floor_sicurezza_pct
+        # Ancorato al capitale REALE rilevato al primo avvio live (self.risk.
+        # capitale_iniziale_eur_effettivo), non al default fisso di config.py:
+        # se hai depositato più o meno di 100€, il floor si adegua di conseguenza.
+        floor_eur = self.risk.capitale_iniziale_eur_effettivo * CONFIG.risk.floor_sicurezza_pct
         if saldo_eur < floor_eur:
             if self.risk.forza_pausa_sicurezza():
                 log.critical(
@@ -378,9 +381,37 @@ class MemecoinBot:
     # ---------------- LOOP PRINCIPALE ----------------
 
     async def run(self):
-        log.info("🚀 Bot avviato | modalità=%s | capitale=%.2f EUR", CONFIG.mode.upper(), self.risk.capitale_eur)
         if CONFIG.mode == "live":
             log.warning("⚠️  MODALITÀ LIVE: soldi veri a rischio!")
+            # Al PRIMISSIMO avvio live (nessuno stato precedente su disco) ancora
+            # capitale iniziale, circuit breaker giornaliero e floor di sicurezza
+            # al saldo VERO del wallet, non al default hardcoded in config.py.
+            # Se già esiste uno stato_bot.json, NON si tocca: si perderebbe la
+            # contabilità accumulata dei trade già fatti.
+            if not self._stato_precedente_trovato:
+                await self._aggiorna_prezzo_sol()
+                saldo_sol = await self.executor.saldo_sol()
+                if self.prezzo_sol_eur > 0 and saldo_sol > 0:
+                    saldo_eur = saldo_sol * self.prezzo_sol_eur
+                    self.risk.imposta_capitale_iniziale_reale(saldo_eur)
+                    log.info("💰 Capitale iniziale rilevato dal wallet reale: %.2f€ (%.4f SOL)", saldo_eur, saldo_sol)
+                    await self.telegram.invia(
+                        f"💰 Primo avvio live: capitale iniziale ancorato al saldo reale del wallet: "
+                        f"<b>{saldo_eur:.2f}€</b> ({saldo_sol:.4f} SOL).\n"
+                        f"Floor di sicurezza: {CONFIG.risk.floor_sicurezza_pct * 100:.0f}% di questo valore "
+                        f"(≈{saldo_eur * CONFIG.risk.floor_sicurezza_pct:.2f}€) — sotto questa soglia il bot si ferma da solo."
+                    )
+                else:
+                    log.critical(
+                        "🚨 Impossibile rilevare il saldo reale del wallet all'avvio (SOL=%.4f, prezzo_sol_eur=%.2f). "
+                        "Il capitale iniziale resta il default di config.py (%.2f€) — VERIFICA wallet/RPC prima di operare.",
+                        saldo_sol, self.prezzo_sol_eur, CONFIG.risk.capitale_iniziale_eur,
+                    )
+                    await self.telegram.invia(
+                        "🚨 Impossibile rilevare il saldo reale del wallet all'avvio. Il floor di sicurezza userà "
+                        "il default di config.py, che potrebbe NON corrispondere al capitale vero. Verifica wallet/RPC."
+                    )
+        log.info("🚀 Bot avviato | modalità=%s | capitale=%.2f EUR", CONFIG.mode.upper(), self.risk.capitale_eur)
         asyncio.create_task(self.telegram.poll_comandi())
         await self.telegram.invia(
             f"🚀 Bot avviato | modalità={CONFIG.mode.upper()} | capitale tracciato={self.risk.capitale_eur:.2f}€\n"

@@ -20,7 +20,7 @@ class APIConfig:
 
     # Anthropic (analisi AI dei token)
     anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
-    claude_model: str = "claude-sonnet-4-6"
+    claude_model: str = "claude-sonnet-5"
 
     # Wallet (chiave privata in base58 — TENERE SOLO IN .env)
     wallet_private_key: str = os.getenv("WALLET_PRIVATE_KEY", "")
