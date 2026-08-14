@@ -1,53 +1,36 @@
 """
-market_sentiment.py — Sentiment AGGREGATO del mercato memecoin (non del singolo token).
+market_sentiment.py — Sentiment AGGREGATO del mercato memecoin, 100% locale.
 
 Differenza con sentiment.py:
-  - sentiment.py    → "Questo specifico token ha hype organico o è shill?"
-  - market_sentiment.py → "Il mercato memecoin nel suo complesso è in euforia,
-                            normale, o in fase di panico/liquidazione?"
+  - sentiment.py         → "Questo specifico token ha una presenza social solida?"
+  - market_sentiment.py  → "Il mercato memecoin/crypto nel suo complesso è in
+                             euforia, normale, o in fase di panico/liquidazione?"
 
-Perché serve: un token tecnicamente pulito che passa tutti i filtri si comporta
-in modo molto diverso se lanciato durante un mercato in "risk-on" euforico
-rispetto a un mercato in "risk-off" post-crollo (es. dopo un evento
-macro negativo, un hack importante, o una cascata di rug pull mediatici).
+Fonti (entrambe pubbliche, gratuite, senza API key):
+  1. Crypto Fear & Greed Index (alternative.me) — indice 0-100 aggregato da
+     volatilità, momentum/volume, social media, dominance, trend di ricerca.
+  2. Variazione SOL 24h (CoinGecko, endpoint pubblico) — il regime memecoin
+     su Solana segue da vicino il prezzo di SOL stesso.
 
-Il regime di mercato NON blocca mai il bot del tutto (niente override totale):
-modula il cluster_top_n e la size massima concessa. Un mercato in panico
-riduce l'esposizione, non la azzera — resta comunque il risk manager a
-decidere i singoli trade.
+Nessuna delle due richiede ANTHROPIC_API_KEY: il regime di mercato non
+dipende più da nessuna AI esterna, solo da dati di mercato pubblici.
 
-Uso tipico: chiamato una volta ogni ~30-60 minuti (non a ogni ciclo:
-il regime di mercato cambia lentamente, e ogni chiamata costa una web search).
+Il regime di mercato NON blocca mai il bot del tutto: modula il
+cluster_top_n e la size massima concessa. Un mercato in panico riduce
+l'esposizione, non la azzera.
+
+Uso tipico: chiamato una volta ogni ~30-60 minuti (cache), non ad ogni ciclo.
 """
 
-import json
 import logging
 import time
 
 import aiohttp
 
-from config import CONFIG
-
 log = logging.getLogger("market_sentiment")
 
-SYSTEM = """Sei un analista di mercato per il settore memecoin su Solana e in generale crypto.
-Usa la ricerca web per valutare il CLIMA GENERALE del mercato memecoin nelle ultime 24 ore,
-NON un singolo token. Cerca notizie, volumi aggregati, eventi macro (BTC/SOL trend,
-notizie regolatorie, hack, exploit di rilievo, sentiment generale su crypto twitter/X).
-
-Classifica il regime in una di queste categorie:
-- EUFORIA: volumi alti, molti lanci, FOMO diffuso, rischio di bolla/top locale
-- NORMALE: attività ordinaria, nessun segnale estremo
-- CAUTELA: segnali di raffreddamento, volumi in calo, incertezza
-- PANICO: crollo diffuso, liquidazioni, eventi negativi maggiori (hack, regolamentazione avversa)
-
-Rispondi SOLO con JSON valido, senza markdown:
-{"regime": "EUFORIA"|"NORMALE"|"CAUTELA"|"PANICO",
- "score": <0-100, dove 50=normale, >70=euforia, <30=panico>,
- "note": "<max 200 caratteri sui fattori principali>",
- "eventi_rilevanti": ["<evento1>", "<evento2>"]}
-
-Sii conservativo: se le informazioni sono scarse o ambigue, classifica come NORMALE con score 50."""
+FNG_URL = "https://api.alternative.me/fng/?limit=1"
+SOL_PRICE_URL = "https://api.coingecko.com/api/v3/simple/price?ids=solana&vs_currencies=usd&include_24hr_change=true"
 
 
 class MarketSentiment:
@@ -62,56 +45,69 @@ class MarketSentiment:
         if not forza_refresh and self.cache and (time.time() - self.cache_ts) < self.ttl_sec:
             return self.cache
 
-        risultato = await self._interroga_claude()
+        risultato = await self._calcola_regime()
         self.cache = risultato
         self.cache_ts = time.time()
         return risultato
 
-    async def _interroga_claude(self) -> dict:
-        body = {
-            "model": CONFIG.api.claude_model,
-            "max_tokens": 600,
-            "system": SYSTEM,
-            "messages": [{
-                "role": "user",
-                "content": "Valuta il regime di mercato memecoin/Solana attuale.",
-            }],
-            "tools": [{"type": "web_search_20250305", "name": "web_search", "max_uses": 3}],
-        }
-        headers = {
-            "x-api-key": CONFIG.api.anthropic_api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
+    async def _fear_greed(self) -> int | None:
         try:
-            async with self.session.post(
-                "https://api.anthropic.com/v1/messages", json=body, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=90),
-            ) as r:
+            async with self.session.get(FNG_URL, timeout=aiohttp.ClientTimeout(total=10)) as r:
                 if r.status != 200:
-                    log.error("Market sentiment HTTP %s: %s", r.status, await r.text())
-                    return self._fallback()
+                    return None
                 data = await r.json()
+                return int(data["data"][0]["value"])
         except Exception as e:
-            log.error("Errore market sentiment: %s", e)
+            log.warning("Fear&Greed non disponibile: %s", e)
+            return None
+
+    async def _variazione_sol_24h(self) -> float | None:
+        try:
+            async with self.session.get(SOL_PRICE_URL, timeout=aiohttp.ClientTimeout(total=10)) as r:
+                if r.status != 200:
+                    return None
+                data = await r.json()
+                return float(data["solana"]["usd_24h_change"])
+        except Exception as e:
+            log.warning("Variazione SOL 24h non disponibile: %s", e)
+            return None
+
+    async def _calcola_regime(self) -> dict:
+        fng, var_sol = await self._fear_greed(), await self._variazione_sol_24h()
+
+        if fng is None and var_sol is None:
             return self._fallback()
 
-        try:
-            text = "".join(b.get("text", "") for b in data.get("content", []) if b.get("type") == "text")
-            text = text.replace("```json", "").replace("```", "").strip()
-            start = text.rfind("{")
-            result = json.loads(text[start:])
-            log.info("🌡️ Regime di mercato: %s (score %s) — %s",
-                     result.get("regime"), result.get("score"), result.get("note"))
-            return result
-        except (json.JSONDecodeError, ValueError, KeyError) as e:
-            log.error("Market sentiment non parsabile: %s", e)
-            return self._fallback()
+        # Score 0-100 combinato: Fear&Greed pesa di più (è già un aggregato
+        # multi-fattore), la variazione SOL 24h lo affina con un segnale
+        # specifico Solana. Se una fonte manca, si usa solo l'altra.
+        componenti = []
+        if fng is not None:
+            componenti.append((fng, 0.65))
+        if var_sol is not None:
+            # +15% in 24h → contributo massimo (100) | -15% → contributo minimo (0)
+            score_sol = max(0.0, min(100.0, 50 + var_sol / 15 * 50))
+            componenti.append((score_sol, 0.35))
+        peso_tot = sum(p for _, p in componenti)
+        score = round(sum(v * p for v, p in componenti) / peso_tot)
+
+        if score >= 70:
+            regime = "EUFORIA"
+        elif score >= 45:
+            regime = "NORMALE"
+        elif score >= 25:
+            regime = "CAUTELA"
+        else:
+            regime = "PANICO"
+
+        note = f"Fear&Greed={fng if fng is not None else 'n/d'}, SOL 24h={var_sol:+.1f}%" if var_sol is not None else f"Fear&Greed={fng}"
+        log.info("🌡️ Regime di mercato: %s (score %d) — %s", regime, score, note)
+        return {"regime": regime, "score": score, "note": note, "eventi_rilevanti": []}
 
     @staticmethod
     def _fallback() -> dict:
-        """Errore = prudenza: regime NORMALE, nessuna modulazione applicata."""
-        return {"regime": "NORMALE", "score": 50, "note": "analisi non disponibile (fallback)", "eventi_rilevanti": []}
+        """Errore su entrambe le fonti = prudenza: regime NORMALE, nessuna modulazione."""
+        return {"regime": "NORMALE", "score": 50, "note": "dati di mercato non disponibili (fallback)", "eventi_rilevanti": []}
 
     # ---------------- MODULAZIONE (usata dal bot) ----------------
 

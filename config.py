@@ -18,10 +18,6 @@ class APIConfig:
     rpc_url: str = field(init=False)
     ws_url: str = field(init=False)
 
-    # Anthropic (analisi AI dei token)
-    anthropic_api_key: str = os.getenv("ANTHROPIC_API_KEY", "")
-    claude_model: str = "claude-sonnet-5"
-
     # Wallet (chiave privata in base58 — TENERE SOLO IN .env)
     wallet_private_key: str = os.getenv("WALLET_PRIVATE_KEY", "")
 
@@ -145,8 +141,10 @@ class FilterConfig:
     min_liq_su_mcap: float = 0.08
 
     # ---- SENTIMENT SOCIAL ----
+    # Score 0-100 puramente strutturale (twitter/telegram/sito/immagine/boost su
+    # DexScreener): senza AI+web search non si distingue più hype organico da
+    # shill coordinato, quindi il gate resta solo sulla presenza social minima.
     min_sentiment_score: int = 55            # gate d'ingresso sul sentiment
-    scarta_se_shill: bool = True             # hype "shill" coordinato = scarto diretto
 
     # ---- MOMENTUM D'INGRESSO ----
     min_momentum_score: float = 50.0         # sotto: token buono ma timing sbagliato
@@ -174,10 +172,12 @@ class BotConfig:
     # File di controllo manuale (start/pausa/stop), letto ad ogni ciclo.
     file_controllo: str = "control.json"
 
-    # Usa Claude per l'analisi qualitativa (consigliato)
-    usa_analisi_claude: bool = True
+    # Usa l'analisi quantitativa locale (local_analyzer.py) come gate finale
+    # prima dell'acquisto. Nessuna chiamata AI esterna, nessun costo, nessuna
+    # dipendenza da ANTHROPIC_API_KEY.
+    usa_analisi_locale: bool = True
 
-    # Soglia minima score Claude (0-100) per aprire una posizione
+    # Soglia minima score (0-100, formula locale) per aprire una posizione
     min_claude_score: int = 70
 
 

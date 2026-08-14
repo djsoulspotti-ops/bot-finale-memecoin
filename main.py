@@ -4,8 +4,9 @@ main.py — Orchestratore del bot. Loop principale h24.
 Pipeline per ogni ciclo (~20 secondi):
   1. SCAN     → scanner.py trova nuovi pool
   2. FILTER   → filters.py applica i filtri anti-rug       ┐ eseguiti in
-  3. SENTIMENT→ sentiment.py valuta il sentiment social     ┘ parallelo tra loro
-  4. ANALYZE  → claude_analyzer.py chiede a Claude uno score 0-100
+  3. SENTIMENT→ sentiment.py valuta la presenza social      ┘ parallelo tra loro
+  4. ANALYZE  → local_analyzer.py calcola uno score 0-100 con formula
+                quantitativa locale (nessuna chiamata AI esterna)
   5. EXECUTE  → executor.py compra via Jupiter (se score >= soglia)
   6. MONITOR  → risk_manager.py controlla SL/TP/trailing su ogni posizione
 
@@ -39,10 +40,10 @@ import sys
 import aiohttp
 
 from agent import AgentSupervisor
-from claude_analyzer import ClaudeAnalyzer
 from config import CONFIG
 from executor import JupiterExecutor, LAMPORTS_PER_SOL
 from filters import TokenFilter
+from local_analyzer import LocalAnalyzer
 from market_conditions import MarketConditions
 from market_sentiment import MarketSentiment
 from risk_manager import Posizione, RiskManager
@@ -72,7 +73,7 @@ class MemecoinBot:
     def __init__(self, session: aiohttp.ClientSession):
         self.scanner = PoolScanner(session)
         self.filtro = TokenFilter(session)
-        self.claude = ClaudeAnalyzer(session)
+        self.analizzatore = LocalAnalyzer()
         self.sentiment = SentimentAnalyzer(session)
         self.market = MarketConditions(session)
         self.mkt_sentiment = MarketSentiment(session)
@@ -112,15 +113,12 @@ class MemecoinBot:
                 log.info("Sentiment insufficiente per %s: %s (%s)", c.symbol,
                          sent.get("sentiment_score"), sent.get("hype_type"))
                 return None
-            if CONFIG.filters.scarta_se_shill and sent.get("hype_type") == "shill":
-                log.info("Shill coordinato rilevato su %s → scarto", c.symbol)
-                return None
 
             analisi = {"score": 75}
-            if CONFIG.usa_analisi_claude:
-                analisi = await self.claude.analizza(c, fr)
+            if CONFIG.usa_analisi_locale:
+                analisi = await self.analizzatore.analizza(c, fr)
                 if analisi.get("decisione") != "COMPRA" or analisi.get("score", 0) < CONFIG.min_claude_score:
-                    log.info("Claude scarta %s: %s", c.symbol, analisi.get("motivazione"))
+                    log.info("Analisi locale scarta %s: %s", c.symbol, analisi.get("motivazione"))
                     return None
 
             comp = score_composito(analisi.get("score", 0), sent.get("sentiment_score", 0), mom)

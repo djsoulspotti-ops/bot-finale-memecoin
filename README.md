@@ -1,6 +1,7 @@
 # Memecoin Bot — Solana (Raydium/Pump.fun via Jupiter)
 
-Bot automatico h24 per memecoin Solana con filtri anti-rug e analisi AI via API Claude.
+Bot automatico h24 per memecoin Solana con filtri anti-rug e analisi
+quantitativa 100% locale (nessuna AI esterna, nessun costo per-token).
 
 ## Struttura
 ```
@@ -9,18 +10,25 @@ bot/
 ├── config.py           # tutti i parametri (rischio, filtri, API)
 ├── scanner.py          # rileva nuovi pool (DexScreener)
 ├── filters.py          # filtri anti-rug (RugCheck + metriche)
-├── claude_analyzer.py  # analisi qualitativa via API Anthropic
-├── sentiment.py        # sentiment social (segnali strutturali + web search)
+├── local_analyzer.py   # score 0-100 locale (vol/liq, buy/sell, mcap/liq, RugCheck, holder)
+├── sentiment.py        # presenza social (segnali strutturali DexScreener, locale)
 ├── market_conditions.py# market calm score per le uscite in tranche
-├── market_sentiment.py # sentiment AGGREGATO del mercato memecoin (regime globale)
+├── market_sentiment.py # regime di mercato aggregato (Fear&Greed Index + SOL 24h, locale)
+├── agent.py             # supervisore automatico ogni 6h (regole locali, non AI)
 ├── dashboard.py         # server locale con dashboard web (http://localhost:8050)
 ├── dashboard_static/    # frontend della dashboard (index.html)
 ├── analizza_segnali.py  # analisi win rate per fascia di score (da usare dopo il paper trading)
 ├── executor.py         # swap via Jupiter, firma con solders
 ├── risk_manager.py     # position sizing, SL/TP, circuit breaker
+├── control.py           # comandi manuali: start / pausa / stop
+├── telegram_bot.py       # notifiche + comandi PARTI/PAUSA/STOP via Telegram
 ├── requirements.txt
 └── .env.example        # template variabili d'ambiente
 ```
+
+Nessun modulo chiama più API a pagamento: l'unica chiave a pagamento
+possibile resta Helius (piano free già sufficiente). Fear&Greed Index e
+prezzo SOL vengono letti da endpoint pubblici gratuiti senza API key.
 
 ## Setup rapido
 ```bash

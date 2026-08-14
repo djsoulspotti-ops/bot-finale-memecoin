@@ -1,34 +1,38 @@
 """
-agent.py — Supervisore agentico del bot.
+agent.py — Supervisore automatico del bot, 100% locale (nessuna chiamata AI).
 
-Ogni 6 ore Claude viene invocato come AGENTE (loop di tool use multi-step):
-legge le statistiche dei trade, ispeziona i parametri correnti, ragiona,
-e propone modifiche ai parametri — che vengono applicate SOLO se dentro
-i bounds di sicurezza hard-coded qui sotto. L'agente può ottimizzare,
-non può rendere il bot più pericoloso.
+Ogni 6 ore analizza i trade chiusi e, SOLO se i dati lo giustificano,
+regola i parametri — applicati esclusivamente dentro i BOUNDS di sicurezza
+hard-coded qui sotto. Le stesse regole che prima venivano affidate al
+giudizio di un LLM sono qui codificate esplicitamente: possono ottimizzare,
+non possono mai rendere il bot più aggressivo/pericoloso.
 
-Tool esposti all'agente:
-  - leggi_statistiche : win rate, PnL, distribuzione motivi di uscita
-  - leggi_parametri   : valori correnti dei parametri regolabili
-  - imposta_parametri : applica nuovi valori (validati contro i BOUNDS)
+Principi (identici alla versione precedente, ora if/else invece che prompt):
+1. Con meno di 15 trade chiusi, NON modificare nulla: il campione è troppo piccolo.
+2. Se le perdite vengono soprattutto da stop loss immediati → i filtri d'ingresso
+   sono laschi: alza score minimo e liquidità minima.
+3. Se le perdite vengono da uscite a tempo/trailing senza mai raggiungere il
+   ladder di take-profit → il timing d'ingresso è debole: alza il momentum minimo.
+4. Se molte posizioni escono in ladder con buon win rate → il sistema funziona: non toccare.
+5. Preferisce SEMPRE rendere il bot più selettivo (soglie più alte), mai più aggressivo.
+6. Massimo 2 parametri modificati per sessione.
 
-BOUNDS (non negoziabili, fuori dalla portata dell'agente):
-  size max 20%, stop loss tra -15% e -35%, Claude score minimo 60,
-  sentiment minimo 45, momentum minimo 30. Il circuit breaker giornaliero
-  e il paper/live mode NON sono modificabili dall'agente.
+BOUNDS (non negoziabili, fuori dalla portata di qualunque logica automatica):
+  size max 20%, stop loss tra -15% e -35%, score minimo 60-95,
+  sentiment minimo 45-90, momentum minimo 30-85. Il circuit breaker
+  giornaliero, il floor di sicurezza sul saldo reale e il paper/live mode
+  NON sono modificabili automaticamente.
 """
 
 import json
 import logging
 import time
 
-import aiohttp
-
 from config import CONFIG
 
 log = logging.getLogger("agent")
 
-# (min, max) per ogni parametro che l'agente può toccare
+# (min, max) per ogni parametro che la logica automatica può toccare
 BOUNDS = {
     "max_posizione_pct":   (0.05, 0.20),
     "stop_loss_pct":       (-0.35, -0.15),
@@ -39,56 +43,19 @@ BOUNDS = {
     "calm_soglia_vendita": (45.0, 80.0),
 }
 
-TOOLS = [
-    {
-        "name": "leggi_statistiche",
-        "description": "Statistiche dei trade chiusi: numero, win rate, PnL totale, motivi di uscita.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "leggi_parametri",
-        "description": "Valori correnti dei parametri regolabili e relativi bounds.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "imposta_parametri",
-        "description": "Applica nuovi valori ai parametri. Solo i parametri nei bounds vengono accettati.",
-        "input_schema": {
-            "type": "object",
-            "properties": {"parametri": {"type": "object", "description": "coppie nome: valore"}},
-            "required": ["parametri"],
-        },
-    },
-]
-
-SYSTEM = """Sei il supervisore di un bot di trading su memecoin Solana in esecuzione continua.
-Ogni 6 ore analizzi le performance e, SOLO se i dati lo giustificano, regoli i parametri.
-
-Principi:
-1. Con meno di 15 trade chiusi, NON modificare nulla: il campione è troppo piccolo.
-2. Se le perdite vengono soprattutto da stop loss immediati → i filtri d'ingresso sono laschi: alza le soglie (claude/sentiment/momentum/liquidità).
-3. Se le perdite vengono da time-exit → stai comprando token morti: alza il momentum minimo.
-4. Se molte posizioni escono in trailing con buon profitto → il sistema funziona: non toccare.
-5. Preferisci SEMPRE rendere il bot più selettivo che più aggressivo.
-6. Massimo 2 parametri modificati per sessione, con variazioni piccole (≤20% del valore).
-
-Il tuo verdetto finale (l'ultimo messaggio, quando non chiami più tool) DEVE seguire ESATTAMENTE questa struttura in italiano semplice, così un umano non tecnico può capirlo:
-
-OSSERVAZIONE: <cosa dicono i dati, 1-2 frasi>
-DIAGNOSI: <qual è il problema o il punto di forza, 1-2 frasi>
-DECISIONE: <cosa hai cambiato e di quanto, oppure "Nessuna modifica" con il motivo>
-PERCHÉ: <il ragionamento che collega diagnosi e decisione, 1-2 frasi>
-COSA GUARDARE: <cosa dovrebbe osservare l'utente nelle prossime ore per capire se avevi ragione>"""
+SOGLIA_TRADE_MINIMI = 15
 
 
 class AgentSupervisor:
-    def __init__(self, session: aiohttp.ClientSession, risk_manager):
+    def __init__(self, session, risk_manager):
+        # `session` non serve più (nessuna chiamata di rete): si mantiene il
+        # parametro solo per non rompere la firma usata da main.py.
         self.session = session
         self.risk = risk_manager
         self.ultimo_run = 0.0
         self.intervallo_sec = 6 * 3600
 
-    # ---------------- TOOL IMPLEMENTATIONS ----------------
+    # ---------------- STATISTICHE E PARAMETRI ----------------
 
     def _statistiche(self) -> dict:
         trades = []
@@ -130,7 +97,7 @@ class AgentSupervisor:
         applicati, rifiutati = {}, {}
         for nome, valore in parametri.items():
             if nome not in BOUNDS:
-                rifiutati[nome] = "parametro non modificabile dall'agente"
+                rifiutati[nome] = "parametro non modificabile automaticamente"
                 continue
             lo, hi = BOUNDS[nome]
             try:
@@ -141,7 +108,6 @@ class AgentSupervisor:
             if not (lo <= v <= hi):
                 rifiutati[nome] = f"fuori bounds [{lo}, {hi}]"
                 continue
-            # Applica sul CONFIG vivo
             if nome in ("max_posizione_pct", "stop_loss_pct", "calm_soglia_vendita"):
                 setattr(CONFIG.risk, nome, v)
             elif nome == "min_claude_score":
@@ -150,84 +116,87 @@ class AgentSupervisor:
                 setattr(CONFIG.filters, nome, int(v) if nome != "min_momentum_score" else v)
             applicati[nome] = v
         if applicati:
-            log.info("🤖 Agente: parametri aggiornati %s", applicati)
+            log.info("🤖 Supervisore: parametri aggiornati %s", applicati)
             with open("agent_log.jsonl", "a") as f:
                 f.write(json.dumps({"ts": time.time(), "applicati": applicati, "rifiutati": rifiutati}) + "\n")
         return {"applicati": applicati, "rifiutati": rifiutati}
 
-    # ---------------- AGENT LOOP ----------------
+    # ---------------- LOGICA DI DECISIONE (locale, deterministica) ----------------
+
+    def _decidi(self, stat: dict) -> tuple[str, dict]:
+        """Applica le regole descritte nel docstring di modulo.
+        Ritorna (verdetto testuale in italiano, risultato di _applica)."""
+        n = stat.get("trade_chiusi", 0)
+        if n < SOGLIA_TRADE_MINIMI:
+            verdetto = (
+                f"OSSERVAZIONE: {n} trade chiusi finora.\n"
+                f"DIAGNOSI: campione troppo piccolo per essere significativo (servono almeno {SOGLIA_TRADE_MINIMI}).\n"
+                f"DECISIONE: Nessuna modifica.\n"
+                f"PERCHÉ: con un campione così piccolo qualunque aggiustamento sarebbe rumore statistico, non segnale.\n"
+                f"COSA GUARDARE: accumula altri {max(0, SOGLIA_TRADE_MINIMI - n)} trade chiusi prima della prossima revisione utile."
+            )
+            return verdetto, {"applicati": {}, "rifiutati": {}}
+
+        win_rate = stat.get("win_rate", 0.0)
+        motivi = stat.get("motivi_uscita", {})
+        stop_loss_share = motivi.get("stop_loss", 0) / n
+        trailing_time_share = motivi.get("trailing_o_time", 0) / n
+        ladder_share = motivi.get("ladder", 0) / n
+
+        proposte: dict = {}
+        if win_rate < 0.35 and stop_loss_share >= 0.5:
+            proposte["min_claude_score"] = min(BOUNDS["min_claude_score"][1], CONFIG.min_claude_score + 5)
+            proposte["min_liquidity_usd"] = min(BOUNDS["min_liquidity_usd"][1], round(CONFIG.filters.min_liquidity_usd * 1.15))
+            diagnosi = f"la maggior parte delle perdite ({stop_loss_share:.0%}) viene da stop loss immediati: i filtri d'ingresso sono troppo permissivi."
+            perche = "alzare lo score minimo e la liquidità minima riduce i token deboli che entrano e finiscono subito in stop loss."
+        elif win_rate < 0.40 and trailing_time_share >= 0.5 and ladder_share < 0.15:
+            proposte["min_momentum_score"] = min(BOUNDS["min_momentum_score"][1], CONFIG.filters.min_momentum_score + 5)
+            diagnosi = f"poche posizioni raggiungono il ladder di take-profit ({ladder_share:.0%}), la maggior parte esce per tempo/trailing senza guadagno: probabile timing d'ingresso debole."
+            perche = "alzare il momentum minimo richiesto in ingresso filtra i token comprati senza una vera accelerazione in corso."
+        elif win_rate >= 0.55 and ladder_share >= 0.2:
+            diagnosi = f"win rate {win_rate:.0%} con {ladder_share:.0%} di uscite da ladder di take-profit: il sistema sta funzionando."
+            perche = "non c'è motivo di cambiare parametri che stanno già producendo risultati positivi."
+        else:
+            diagnosi = "nessun pattern abbastanza netto nei dati per giustificare un aggiustamento con sicurezza."
+            perche = "meglio non modificare sulla base di un segnale ambiguo: rischia di peggiorare le cose senza una causa identificata con certezza."
+
+        risultato = self._applica(proposte) if proposte else {"applicati": {}, "rifiutati": {}}
+        decisione_str = (
+            ", ".join(f"{k} → {v}" for k, v in risultato["applicati"].items())
+            if risultato["applicati"] else "Nessuna modifica."
+        )
+        verdetto = (
+            f"OSSERVAZIONE: {n} trade chiusi, win rate {win_rate:.0%}, PnL totale {stat.get('pnl_totale_eur', 0):+.2f}€. "
+            f"Motivi di uscita: {motivi}.\n"
+            f"DIAGNOSI: {diagnosi}\n"
+            f"DECISIONE: {decisione_str}\n"
+            f"PERCHÉ: {perche}\n"
+            f"COSA GUARDARE: confronta win rate e distribuzione dei motivi di uscita nei prossimi trade "
+            f"con questi valori per capire se il cambiamento ha aiutato."
+        )
+        return verdetto, risultato
+
+    # ---------------- SCHEDULAZIONE ----------------
 
     async def forse_esegui(self):
         if time.time() - self.ultimo_run < self.intervallo_sec:
             return
         self.ultimo_run = time.time()
         try:
-            await self._loop_agentico()
+            stat = self._statistiche()
+            parametri_prima = self._parametri()["correnti"]
+            verdetto, risultato = self._decidi(stat)
+            log.info("🤖 Verdetto supervisore: %s", verdetto.replace("\n", " ")[:300])
+            self._scrivi_report(verdetto, {
+                "statistiche_lette": stat,
+                "parametri_prima": parametri_prima,
+                "modifiche": risultato,
+            })
         except Exception as e:
-            log.error("Errore supervisore agentico: %s", e)
-
-    async def _loop_agentico(self, max_turni: int = 6):
-        messages = [{"role": "user", "content": "Analizza le performance del bot e decidi se e come regolare i parametri."}]
-        headers = {
-            "x-api-key": CONFIG.api.anthropic_api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        }
-        # Traccia tutto ciò che l'agente ha visto e fatto, per il report
-        traccia = {"statistiche_lette": None, "parametri_prima": None, "modifiche": None}
-
-        for _ in range(max_turni):
-            body = {
-                "model": CONFIG.api.claude_model,
-                "max_tokens": 1500,
-                "system": SYSTEM,
-                "messages": messages,
-                "tools": TOOLS,
-            }
-            async with self.session.post(
-                "https://api.anthropic.com/v1/messages", json=body, headers=headers,
-                timeout=aiohttp.ClientTimeout(total=60),
-            ) as r:
-                if r.status != 200:
-                    log.error("Agente HTTP %s: %s", r.status, await r.text())
-                    return
-                data = await r.json()
-
-            messages.append({"role": "assistant", "content": data["content"]})
-
-            if data.get("stop_reason") != "tool_use":
-                verdetto = "".join(b.get("text", "") for b in data["content"] if b.get("type") == "text")
-                log.info("🤖 Verdetto agente: %s", verdetto.strip()[:300])
-                self._scrivi_report(verdetto.strip(), traccia)
-                return
-
-            # Esegui i tool richiesti, tracciando gli output rilevanti
-            results = []
-            for block in data["content"]:
-                if block.get("type") != "tool_use":
-                    continue
-                nome, tid, inp = block["name"], block["id"], block.get("input", {})
-                if nome == "leggi_statistiche":
-                    out = self._statistiche()
-                    traccia["statistiche_lette"] = out
-                elif nome == "leggi_parametri":
-                    out = self._parametri()
-                    traccia["parametri_prima"] = out.get("correnti")
-                elif nome == "imposta_parametri":
-                    out = self._applica(inp.get("parametri", {}))
-                    traccia["modifiche"] = out
-                else:
-                    out = {"errore": "tool sconosciuto"}
-                results.append({"type": "tool_result", "tool_use_id": tid, "content": json.dumps(out)})
-            messages.append({"role": "user", "content": results})
-
-        log.warning("Agente: raggiunto il limite di turni senza verdetto finale")
+            log.error("Errore supervisore automatico: %s", e)
 
     def _scrivi_report(self, verdetto: str, traccia: dict):
-        """
-        Scrive un report leggibile in report_agente.md (ultimo run in cima).
-        Serve all'utente per CAPIRE le decisioni dell'agente, non per subirle.
-        """
+        """Scrive un report leggibile in report_agente.md (ultimo run in cima)."""
         ts = time.strftime("%Y-%m-%d %H:%M")
         stat = traccia.get("statistiche_lette") or {}
         mod = traccia.get("modifiche") or {}
@@ -236,7 +205,6 @@ class AgentSupervisor:
 
         righe = [f"# Report supervisore — {ts}", ""]
 
-        # Riepilogo dati in un colpo d'occhio
         if stat.get("trade_chiusi", 0) > 0:
             righe += [
                 "## Dati al momento dell'analisi",
@@ -250,7 +218,6 @@ class AgentSupervisor:
         else:
             righe += ["## Dati al momento dell'analisi", "- Nessun trade chiuso ancora.", ""]
 
-        # Cosa ha cambiato, in chiaro
         righe.append("## Modifiche applicate")
         if applicati:
             prima = traccia.get("parametri_prima") or {}
@@ -266,11 +233,9 @@ class AgentSupervisor:
                 righe.append(f"- `{nome}`: {motivo}")
         righe.append("")
 
-        # Il ragionamento dell'agente, in italiano
-        righe += ["## Ragionamento dell'agente", "", verdetto or "_(nessun verdetto testuale)_", ""]
+        righe += ["## Ragionamento del supervisore", "", verdetto or "_(nessun verdetto)_", ""]
         righe += ["---", ""]
 
-        # Prepend: l'ultimo report resta in cima al file
         nuovo = "\n".join(righe)
         try:
             with open("report_agente.md") as f:
