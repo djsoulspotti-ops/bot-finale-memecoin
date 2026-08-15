@@ -259,7 +259,8 @@ class MemecoinBot:
         if urgente:
             res = await self.executor.vendi(mint, qty)
         else:
-            size_usd = qty / max(pos.quantita_iniziale_raw, 1) * pos.sol_investiti * self.prezzo_sol_eur / 0.93
+            fx_usd_eur = await self._cambio_usd_eur()
+            size_usd = qty / max(pos.quantita_iniziale_raw, 1) * pos.sol_investiti * self.prezzo_sol_eur / fx_usd_eur
             res = await self.executor.vendi_tranches(mint, qty, self.market, size_usd)
 
         # ---- Contabilità basata SOLO su ciò che è stato realmente venduto ----
@@ -276,7 +277,17 @@ class MemecoinBot:
 
         frazione_reale = min(1.0, venduto_raw / max(residuo_prima, 1))
         pnl_pct = pos.pnl_pct(prezzo)
-        valore_venduto_eur = pos.sol_investiti * frazione_reale * self.prezzo_sol_eur
+        # Costo base per unità di token (costante per l'intera posizione,
+        # fissato all'apertura). NB: `frazione_reale` è la frazione del
+        # RESIDUO attuale (quanto restava PRIMA di questa vendita), non
+        # dell'originale — dopo la prima vendita parziale il residuo è già
+        # più piccolo della posizione originale, quindi moltiplicarlo per
+        # pos.sol_investiti (l'intero investimento iniziale) sovrastimerebbe
+        # il capitale attribuito a ogni tranche successiva del ladder. Si
+        # calcola invece sulla quantità REALMENTE venduta rispetto
+        # all'originale, coerente con come è stata dimensionata la posizione.
+        sol_investiti_venduto = pos.sol_investiti * venduto_raw / max(pos.quantita_iniziale_raw, 1)
+        valore_venduto_eur = sol_investiti_venduto * self.prezzo_sol_eur
         pnl_eur = valore_venduto_eur * pnl_pct
         motivo = "stop_loss" if urgente else ("ladder" if pos.tiers_eseguiti else "trailing_o_time")
         breaker_scattato = self.risk.chiudi(mint, pnl_eur, frazione_reale, motivo=motivo)
