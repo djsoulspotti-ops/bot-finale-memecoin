@@ -47,11 +47,12 @@ SOGLIA_TRADE_MINIMI = 15
 
 
 class AgentSupervisor:
-    def __init__(self, session, risk_manager):
+    def __init__(self, session, risk_manager, telegram=None):
         # `session` non serve più (nessuna chiamata di rete): si mantiene il
         # parametro solo per non rompere la firma usata da main.py.
         self.session = session
         self.risk = risk_manager
+        self.telegram = telegram
         self.ultimo_run = 0.0
         self.intervallo_sec = 6 * 3600
 
@@ -192,8 +193,22 @@ class AgentSupervisor:
                 "parametri_prima": parametri_prima,
                 "modifiche": risultato,
             })
+            await self._notifica_telegram(verdetto, risultato)
         except Exception as e:
             log.error("Errore supervisore automatico: %s", e)
+
+    async def _notifica_telegram(self, verdetto: str, risultato: dict):
+        """Il supervisore gira da solo ogni 6h e può cambiare parametri di
+        rischio senza che nessuno lo guardi: senza questa notifica l'unico
+        modo per accorgersene sarebbe aprire report_agente.md sul server."""
+        if not self.telegram:
+            return
+        applicati = risultato.get("applicati") or {}
+        if applicati:
+            emoji, titolo = "🔧", "Supervisore: parametri aggiornati"
+        else:
+            emoji, titolo = "🧭", "Supervisore: nessuna modifica"
+        await self.telegram.invia(f"{emoji} <b>{titolo}</b>\n\n{verdetto}")
 
     def _scrivi_report(self, verdetto: str, traccia: dict):
         """Scrive un report leggibile in report_agente.md (ultimo run in cima)."""

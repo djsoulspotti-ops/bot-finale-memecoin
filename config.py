@@ -156,9 +156,16 @@ class BotConfig:
     risk: RiskConfig = field(default_factory=RiskConfig)
     filters: FilterConfig = field(default_factory=FilterConfig)
 
-    # Modalità: "paper" = simulazione senza soldi veri, "live" = trading reale
-    # INIZIA SEMPRE IN PAPER MODE per almeno 2 settimane
-    mode: str = os.getenv("BOT_MODE", "paper")
+    # Modalità: "paper" = simulazione senza soldi veri, "live" = trading reale.
+    # Default LIVE per scelta esplicita dell'utente: il bot opera con soldi
+    # veri fin dal primo avvio, sul saldo reale del wallet collegato a
+    # WALLET_PRIVATE_KEY (rilevato automaticamente al primo avvio, vedi
+    # RiskManager.imposta_capitale_iniziale_reale in main.py:run()). Le
+    # protezioni esistenti restano tutte attive: floor di sicurezza al 30%
+    # del capitale (RiskConfig.floor_sicurezza_pct), circuit breaker
+    # giornaliero, stop loss, controllo saldo pre-trade. Per tornare a una
+    # simulazione senza rischio: BOT_MODE=paper nel file .env.
+    mode: str = os.getenv("BOT_MODE", "live")
 
     # Intervallo di scansione nuovi pool (secondi)
     scan_interval_sec: int = 20

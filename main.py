@@ -28,8 +28,8 @@ pausa indefinita da solo (indipendentemente da cosa dice la contabilità
 interna) finché non arriva un "python control.py start" esplicito.
 
 Avvio:   python main.py
-Il bot parte in PAPER MODE (simulazione). Per il live: BOT_MODE=live in .env
-— ma solo dopo ALMENO 2 settimane di paper trading con risultati verificati.
+Il bot parte in LIVE MODE (soldi veri, capitale = saldo reale del wallet)
+per default. Per una simulazione senza rischio: BOT_MODE=paper in .env.
 """
 
 import asyncio
@@ -80,8 +80,8 @@ class MemecoinBot:
         self.executor = JupiterExecutor(session)
         self.risk = RiskManager()
         self._stato_precedente_trovato = self.risk.carica_stato()
-        self.agente = AgentSupervisor(session, self.risk)
         self.telegram = TelegramNotifier(session)
+        self.agente = AgentSupervisor(session, self.risk, self.telegram)
         self.session = session
         self.prezzo_sol_eur = 0.0
         # Clustering: buffer di candidati (candidato, score_composito, ts)
