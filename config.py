@@ -20,6 +20,9 @@ class APIConfig:
 
     # Wallet (chiave privata in base58 — TENERE SOLO IN .env)
     wallet_private_key: str = os.getenv("WALLET_PRIVATE_KEY", "")
+    # Chiave pubblica attesa dello stesso wallet (non segreta): usata solo per
+    # verificare all'avvio che WALLET_PRIVATE_KEY corrisponda al wallet giusto.
+    wallet_public_key: str = os.getenv("WALLET_PUBLIC_KEY", "")
 
     # Telegram — notifiche + comandi PARTI/PAUSA/STOP (opzionale: se mancano
     # queste due, l'integrazione resta disattivata senza rompere il bot).

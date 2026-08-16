@@ -123,6 +123,14 @@ class MemecoinBot:
 
             comp = score_composito(analisi.get("score", 0), sent.get("sentiment_score", 0), mom)
             log.info("🧺 %s valutato con score composito %.0f", c.symbol, comp)
+            await self.telegram.invia(
+                f"✅ <b>{c.symbol}</b> rispetta tutti i parametri d'ingresso\n"
+                f"Score composito: {comp:.0f} (locale {analisi.get('score', 0):.0f} · "
+                f"sentiment {sent.get('sentiment_score', 0):.0f} · momentum {mom:.0f})\n"
+                f"Mcap: ${c.market_cap_usd:,.0f} · Liquidità: ${c.liquidity_usd:,.0f} · Dex: {c.dex}\n"
+                f"In coda nel cluster (finestra {CONFIG.risk.cluster_buffer_min} min, "
+                f"verranno comprati i migliori {CONFIG.risk.cluster_top_n})."
+            )
             return (c, comp, analisi.get("score", 0), sent.get("sentiment_score", 0), mom)
 
     async def ciclo_ingresso(self):
@@ -392,6 +400,25 @@ class MemecoinBot:
     async def run(self):
         if CONFIG.mode == "live":
             log.warning("⚠️  MODALITÀ LIVE: soldi veri a rischio!")
+            # Sanity check: la pubkey derivata da WALLET_PRIVATE_KEY deve combaciare
+            # con WALLET_PUBLIC_KEY (se impostata in .env) — altrimenti la chiave
+            # privata è sbagliata/di un altro wallet e il bot lo segnala subito
+            # invece di operare silenziosamente sul wallet sbagliato.
+            if CONFIG.api.wallet_public_key and self.executor.keypair:
+                pubkey_effettiva = str(self.executor.keypair.pubkey())
+                if pubkey_effettiva != CONFIG.api.wallet_public_key:
+                    log.critical(
+                        "🚨 WALLET_PRIVATE_KEY non corrisponde a WALLET_PUBLIC_KEY! "
+                        "Atteso=%s, effettivo=%s — il bot sta operando su un wallet diverso.",
+                        CONFIG.api.wallet_public_key, pubkey_effettiva,
+                    )
+                    await self.telegram.invia(
+                        f"🚨 <b>ATTENZIONE: wallet inatteso</b>\n"
+                        f"WALLET_PRIVATE_KEY corrisponde a <code>{pubkey_effettiva}</code>, "
+                        f"ma il wallet atteso è <code>{CONFIG.api.wallet_public_key}</code>.\n"
+                        f"Il bot sta operando su un wallet DIVERSO da quello previsto. "
+                        f"Verifica WALLET_PRIVATE_KEY in .env prima di fidarti di saldo/trade."
+                    )
             # Al PRIMISSIMO avvio live (nessuno stato precedente su disco) ancora
             # capitale iniziale, circuit breaker giornaliero e floor di sicurezza
             # al saldo VERO del wallet, non al default hardcoded in config.py.
