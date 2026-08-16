@@ -35,8 +35,17 @@ prezzo SOL vengono letti da endpoint pubblici gratuiti senza API key.
 python -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env    # poi compila le chiavi
-python main.py          # parte in PAPER MODE
+python main.py          # DEFAULT: LIVE MODE, soldi veri dal wallet collegato
 ```
+
+## ⚠️ Modalità LIVE di default
+Il bot parte in **LIVE MODE** fin dal primo avvio: opera con soldi veri, sul
+saldo reale del wallet collegato a `WALLET_PRIVATE_KEY`. Al primissimo avvio
+live (nessuno `stato_bot.json` precedente) il capitale iniziale, il circuit
+breaker giornaliero e il floor di sicurezza vengono ancorati automaticamente
+al saldo SOL reale trovato nel wallet — non a un valore fisso in `config.py`.
+Tutte le altre protezioni restano attive (vedi sezione sotto). Per tornare a
+una simulazione senza rischio: `BOT_MODE=paper` nel `.env`.
 
 ## Controllo manuale: start / pausa / stop
 ```bash
@@ -83,7 +92,12 @@ Per velocità d'ingresso reale il bot usa Jito bundle (via Jupiter, supporto
 nativo) con fallback automatico su RPC standard — vedi `config.py: usa_jito`.
 
 
-- Parti SEMPRE in paper mode per almeno 2 settimane.
-- Usa un wallet dedicato con SOLO il capitale del bot.
+## Rischio
+- Il bot parte in LIVE MODE per scelta esplicita: opera fin dal primo avvio
+  con il saldo reale del wallet collegato. Non c'è validazione in paper
+  trading a monte: chi avvia il bot si assume il rischio per intero.
+- Usa un wallet dedicato con SOLO il capitale che sei disposto a perdere.
 - Le memecoin sono l'asset più rischioso che esista: la perdita totale
-  dei 100 EUR è lo scenario più probabile, non l'eccezione.
+  del capitale è lo scenario più probabile, non l'eccezione.
+- Le protezioni automatiche (circuit breaker, stop loss, floor di sicurezza
+  al 30%) limitano il danno, non lo eliminano.

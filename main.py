@@ -28,8 +28,8 @@ pausa indefinita da solo (indipendentemente da cosa dice la contabilità
 interna) finché non arriva un "python control.py start" esplicito.
 
 Avvio:   python main.py
-Il bot parte in PAPER MODE (simulazione). Per il live: BOT_MODE=live in .env
-— ma solo dopo ALMENO 2 settimane di paper trading con risultati verificati.
+Il bot parte in LIVE MODE (soldi veri, capitale = saldo reale del wallet)
+per default. Per una simulazione senza rischio: BOT_MODE=paper in .env.
 """
 
 import asyncio
@@ -80,8 +80,8 @@ class MemecoinBot:
         self.executor = JupiterExecutor(session)
         self.risk = RiskManager()
         self._stato_precedente_trovato = self.risk.carica_stato()
-        self.agente = AgentSupervisor(session, self.risk)
         self.telegram = TelegramNotifier(session)
+        self.agente = AgentSupervisor(session, self.risk, self.telegram)
         self.session = session
         self.prezzo_sol_eur = 0.0
         # Clustering: buffer di candidati (candidato, score_composito, ts)
@@ -123,6 +123,14 @@ class MemecoinBot:
 
             comp = score_composito(analisi.get("score", 0), sent.get("sentiment_score", 0), mom)
             log.info("🧺 %s valutato con score composito %.0f", c.symbol, comp)
+            await self.telegram.invia(
+                f"✅ <b>{c.symbol}</b> rispetta tutti i parametri d'ingresso\n"
+                f"Score composito: {comp:.0f} (locale {analisi.get('score', 0):.0f} · "
+                f"sentiment {sent.get('sentiment_score', 0):.0f} · momentum {mom:.0f})\n"
+                f"Mcap: ${c.market_cap_usd:,.0f} · Liquidità: ${c.liquidity_usd:,.0f} · Dex: {c.dex}\n"
+                f"In coda nel cluster (finestra {CONFIG.risk.cluster_buffer_min} min, "
+                f"verranno comprati i migliori {CONFIG.risk.cluster_top_n})."
+            )
             return (c, comp, analisi.get("score", 0), sent.get("sentiment_score", 0), mom)
 
     async def ciclo_ingresso(self):
@@ -259,7 +267,8 @@ class MemecoinBot:
         if urgente:
             res = await self.executor.vendi(mint, qty)
         else:
-            size_usd = qty / max(pos.quantita_iniziale_raw, 1) * pos.sol_investiti * self.prezzo_sol_eur / 0.93
+            fx_usd_eur = await self._cambio_usd_eur()
+            size_usd = qty / max(pos.quantita_iniziale_raw, 1) * pos.sol_investiti * self.prezzo_sol_eur / fx_usd_eur
             res = await self.executor.vendi_tranches(mint, qty, self.market, size_usd)
 
         # ---- Contabilità basata SOLO su ciò che è stato realmente venduto ----
@@ -276,7 +285,17 @@ class MemecoinBot:
 
         frazione_reale = min(1.0, venduto_raw / max(residuo_prima, 1))
         pnl_pct = pos.pnl_pct(prezzo)
-        valore_venduto_eur = pos.sol_investiti * frazione_reale * self.prezzo_sol_eur
+        # Costo base per unità di token (costante per l'intera posizione,
+        # fissato all'apertura). NB: `frazione_reale` è la frazione del
+        # RESIDUO attuale (quanto restava PRIMA di questa vendita), non
+        # dell'originale — dopo la prima vendita parziale il residuo è già
+        # più piccolo della posizione originale, quindi moltiplicarlo per
+        # pos.sol_investiti (l'intero investimento iniziale) sovrastimerebbe
+        # il capitale attribuito a ogni tranche successiva del ladder. Si
+        # calcola invece sulla quantità REALMENTE venduta rispetto
+        # all'originale, coerente con come è stata dimensionata la posizione.
+        sol_investiti_venduto = pos.sol_investiti * venduto_raw / max(pos.quantita_iniziale_raw, 1)
+        valore_venduto_eur = sol_investiti_venduto * self.prezzo_sol_eur
         pnl_eur = valore_venduto_eur * pnl_pct
         motivo = "stop_loss" if urgente else ("ladder" if pos.tiers_eseguiti else "trailing_o_time")
         breaker_scattato = self.risk.chiudi(mint, pnl_eur, frazione_reale, motivo=motivo)
@@ -381,6 +400,25 @@ class MemecoinBot:
     async def run(self):
         if CONFIG.mode == "live":
             log.warning("⚠️  MODALITÀ LIVE: soldi veri a rischio!")
+            # Sanity check: la pubkey derivata da WALLET_PRIVATE_KEY deve combaciare
+            # con WALLET_PUBLIC_KEY (se impostata in .env) — altrimenti la chiave
+            # privata è sbagliata/di un altro wallet e il bot lo segnala subito
+            # invece di operare silenziosamente sul wallet sbagliato.
+            if CONFIG.api.wallet_public_key and self.executor.keypair:
+                pubkey_effettiva = str(self.executor.keypair.pubkey())
+                if pubkey_effettiva != CONFIG.api.wallet_public_key:
+                    log.critical(
+                        "🚨 WALLET_PRIVATE_KEY non corrisponde a WALLET_PUBLIC_KEY! "
+                        "Atteso=%s, effettivo=%s — il bot sta operando su un wallet diverso.",
+                        CONFIG.api.wallet_public_key, pubkey_effettiva,
+                    )
+                    await self.telegram.invia(
+                        f"🚨 <b>ATTENZIONE: wallet inatteso</b>\n"
+                        f"WALLET_PRIVATE_KEY corrisponde a <code>{pubkey_effettiva}</code>, "
+                        f"ma il wallet atteso è <code>{CONFIG.api.wallet_public_key}</code>.\n"
+                        f"Il bot sta operando su un wallet DIVERSO da quello previsto. "
+                        f"Verifica WALLET_PRIVATE_KEY in .env prima di fidarti di saldo/trade."
+                    )
             # Al PRIMISSIMO avvio live (nessuno stato precedente su disco) ancora
             # capitale iniziale, circuit breaker giornaliero e floor di sicurezza
             # al saldo VERO del wallet, non al default hardcoded in config.py.
