@@ -64,6 +64,23 @@ def leggi_ultimo_regime() -> dict:
     return leggi_json_sicuro("ultimo_regime.json", {"regime": "SCONOSCIUTO", "score": None, "note": ""})
 
 
+def leggi_ultimo_imbuto() -> dict:
+    """Ultima finestra dell'imbuto degli scarti (scritta da metrics.py).
+
+    È il dato che dice PERCHÉ il bot non sta comprando: senza sapere quale
+    stadio scarta i candidati, guardare "0 trade" non dice niente di
+    utile. Include anche l'andamento delle ultime finestre, per vedere se una
+    modifica alle soglie ha spostato il collo di bottiglia.
+    """
+    righe = leggi_jsonl_sicuro("imbuto.jsonl")
+    if not righe:
+        return {"disponibile": False}
+    ultima = righe[-1]
+    storico = [{"ts": r.get("ts"), "valutati": r.get("valutati"),
+                "promossi": r.get("promossi")} for r in righe[-30:]]
+    return {"disponibile": True, "ultima": ultima, "storico": storico}
+
+
 def coda_log(n: int = 200) -> list:
     path = BASE / "bot.log"
     if not path.exists():
@@ -102,6 +119,8 @@ def api_stato():
         "trades_recenti": list(reversed(trades[-20:])),
         "regime": leggi_ultimo_regime(),
         "report_agente": leggi_ultimo_report(),
+        "imbuto": leggi_ultimo_imbuto(),
+        "parametri_runtime": leggi_json_sicuro("parametri_runtime.json", {}),
         "log_recente": coda_log(80),
     })
 

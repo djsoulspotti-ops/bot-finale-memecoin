@@ -94,8 +94,15 @@ def main():
     soglie_score = [("< 60", 0, 60), ("60-70", 60, 70), ("70-80", 70, 80), ("80-90", 80, 90), (">= 90", 90, None)]
     soglie_momentum = [("< 50", 0, 50), ("50-65", 50, 65), ("65-80", 65, 80), (">= 80", 80, None)]
 
-    if any(t.get("claude_score") is not None for t in trades):
-        stampa_tabella("Win rate per fascia di CLAUDE SCORE", analizza_per_fascia(trades, "claude_score", soglie_score))
+    # `score_locale` è il nome attuale; `claude_score` resta letto per non
+    # perdere i trade registrati dalle versioni precedenti del bot.
+    for t in trades:
+        if t.get("score_locale") is None and t.get("claude_score") is not None:
+            t["score_locale"] = t["claude_score"]
+
+    if any(t.get("score_locale") is not None for t in trades):
+        stampa_tabella("Win rate per fascia di SCORE LOCALE",
+                       analizza_per_fascia(trades, "score_locale", soglie_score))
     if any(t.get("sentiment_score") is not None for t in trades):
         stampa_tabella("Win rate per fascia di SENTIMENT SCORE", analizza_per_fascia(trades, "sentiment_score", soglie_score))
     if any(t.get("momentum_score") is not None for t in trades):

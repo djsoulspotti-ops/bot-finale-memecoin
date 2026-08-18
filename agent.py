@@ -18,10 +18,13 @@ Principi (identici alla versione precedente, ora if/else invece che prompt):
 6. Massimo 2 parametri modificati per sessione.
 
 BOUNDS (non negoziabili, fuori dalla portata di qualunque logica automatica):
-  size max 20%, stop loss tra -15% e -35%, score minimo 60-95,
-  sentiment minimo 45-90, momentum minimo 30-85. Il circuit breaker
-  giornaliero, il floor di sicurezza sul saldo reale e il paper/live mode
-  NON sono modificabili automaticamente.
+  vedi il dizionario BOUNDS qui sotto. Il circuit breaker giornaliero, il
+  floor di sicurezza sul valore reale del wallet e il paper/live mode NON
+  sono modificabili automaticamente.
+
+Le modifiche vengono ora PERSISTITE in parametri_runtime.json e ricaricate
+all'avvio: prima erano solo setattr in memoria, quindi ogni riavvio del
+processo le annullava mentre report_agente.md continuava a dichiararle attive.
 """
 
 import json
@@ -35,13 +38,33 @@ log = logging.getLogger("agent")
 # (min, max) per ogni parametro che la logica automatica può toccare
 BOUNDS = {
     "max_posizione_pct":   (0.05, 0.20),
-    "stop_loss_pct":       (-0.35, -0.15),
-    "min_claude_score":    (60, 95),
-    "min_sentiment_score": (45, 90),
-    "min_momentum_score":  (30, 85),
-    "min_liquidity_usd":   (15_000, 100_000),
-    "calm_soglia_vendita": (45.0, 80.0),
+    "stop_loss_pct":       (-0.35, -0.12),
+    "min_score_locale":    (45, 90),
+    "min_sentiment_score": (15, 80),
+    "min_momentum_score":  (25, 80),
+    "min_liquidity_usd":   (4_000, 80_000),
+    "max_dev_mints":       (5, 200),
+    "min_organic_score":   (10.0, 70.0),
+    "calm_soglia_vendita": (35.0, 80.0),
 }
+
+# A quale oggetto di configurazione appartiene ogni parametro. Serve a
+# `_applica` per scrivere nel posto giusto senza catene di if/elif che si
+# disallineano ad ogni rinomina.
+CONTENITORE = {
+    "max_posizione_pct":   "risk",
+    "stop_loss_pct":       "risk",
+    "calm_soglia_vendita": "risk",
+    "min_sentiment_score": "filters",
+    "min_momentum_score":  "filters",
+    "min_liquidity_usd":   "filters",
+    "max_dev_mints":       "filters",
+    "min_organic_score":   "filters",
+    "min_score_locale":    "bot",
+}
+
+# Parametri che devono restare interi
+INTERI = {"min_score_locale", "min_sentiment_score", "max_dev_mints"}
 
 SOGLIA_TRADE_MINIMI = 15
 
@@ -80,19 +103,19 @@ class AgentSupervisor:
             "capitale_corrente_eur": round(self.risk.capitale_eur, 2),
         }
 
+    @staticmethod
+    def _bersaglio(nome: str):
+        """Oggetto di configurazione che contiene `nome`."""
+        dove = CONTENITORE.get(nome)
+        if dove == "risk":
+            return CONFIG.risk
+        if dove == "filters":
+            return CONFIG.filters
+        return CONFIG
+
     def _parametri(self) -> dict:
-        return {
-            "correnti": {
-                "max_posizione_pct": CONFIG.risk.max_posizione_pct,
-                "stop_loss_pct": CONFIG.risk.stop_loss_pct,
-                "min_claude_score": CONFIG.min_claude_score,
-                "min_sentiment_score": CONFIG.filters.min_sentiment_score,
-                "min_momentum_score": CONFIG.filters.min_momentum_score,
-                "min_liquidity_usd": CONFIG.filters.min_liquidity_usd,
-                "calm_soglia_vendita": CONFIG.risk.calm_soglia_vendita,
-            },
-            "bounds": BOUNDS,
-        }
+        correnti = {nome: getattr(self._bersaglio(nome), nome, None) for nome in BOUNDS}
+        return {"correnti": correnti, "bounds": BOUNDS}
 
     def _applica(self, parametri: dict) -> dict:
         applicati, rifiutati = {}, {}
@@ -109,17 +132,28 @@ class AgentSupervisor:
             if not (lo <= v <= hi):
                 rifiutati[nome] = f"fuori bounds [{lo}, {hi}]"
                 continue
-            if nome in ("max_posizione_pct", "stop_loss_pct", "calm_soglia_vendita"):
-                setattr(CONFIG.risk, nome, v)
-            elif nome == "min_claude_score":
-                CONFIG.min_claude_score = int(v)
-            else:
-                setattr(CONFIG.filters, nome, int(v) if nome != "min_momentum_score" else v)
+            if nome in INTERI:
+                v = int(v)
+            setattr(self._bersaglio(nome), nome, v)
             applicati[nome] = v
+
         if applicati:
             log.info("🤖 Supervisore: parametri aggiornati %s", applicati)
-            with open("agent_log.jsonl", "a") as f:
-                f.write(json.dumps({"ts": time.time(), "applicati": applicati, "rifiutati": rifiutati}) + "\n")
+            # PERSISTENZA. Prima le modifiche erano solo setattr su oggetti in
+            # memoria: al primo riavvio del processo (su Railway succede di
+            # routine) i parametri tornavano ai default, mentre
+            # report_agente.md continuava a dichiarare le ottimizzazioni
+            # attive. Il supervisore "imparava" e dimenticava tutto.
+            try:
+                CONFIG.salva_parametri_runtime(applicati)
+            except OSError as e:
+                log.error("Impossibile persistere i parametri del supervisore: %s", e)
+            try:
+                with open("agent_log.jsonl", "a") as f:
+                    f.write(json.dumps({"ts": time.time(), "applicati": applicati,
+                                        "rifiutati": rifiutati}) + "\n")
+            except OSError:
+                pass
         return {"applicati": applicati, "rifiutati": rifiutati}
 
     # ---------------- LOGICA DI DECISIONE (locale, deterministica) ----------------
@@ -140,22 +174,41 @@ class AgentSupervisor:
 
         win_rate = stat.get("win_rate", 0.0)
         motivi = stat.get("motivi_uscita", {})
-        stop_loss_share = motivi.get("stop_loss", 0) / n
-        trailing_time_share = motivi.get("trailing_o_time", 0) / n
+        # I motivi sono quelli REALI restituiti da risk_manager.decisione_uscita.
+        # Prima "trailing_o_time" accorpava tre cause diverse e un trailing
+        # dopo un tier veniva contato come "ladder": il supervisore leggeva
+        # quote distorte verso "il sistema funziona" e non correggeva nulla.
+        stop_loss_share = (motivi.get("stop_loss", 0) + motivi.get("volatility_stop", 0)) / n
+        trailing_share = motivi.get("trailing_stop", 0) / n
+        tempo_share = (motivi.get("no_momentum", 0) + motivi.get("max_holding", 0)) / n
         ladder_share = motivi.get("ladder", 0) / n
 
         proposte: dict = {}
         if win_rate < 0.35 and stop_loss_share >= 0.5:
-            proposte["min_claude_score"] = min(BOUNDS["min_claude_score"][1], CONFIG.min_claude_score + 5)
-            proposte["min_liquidity_usd"] = min(BOUNDS["min_liquidity_usd"][1], round(CONFIG.filters.min_liquidity_usd * 1.15))
-            diagnosi = f"la maggior parte delle perdite ({stop_loss_share:.0%}) viene da stop loss immediati: i filtri d'ingresso sono troppo permissivi."
-            perche = "alzare lo score minimo e la liquidità minima riduce i token deboli che entrano e finiscono subito in stop loss."
-        elif win_rate < 0.40 and trailing_time_share >= 0.5 and ladder_share < 0.15:
-            proposte["min_momentum_score"] = min(BOUNDS["min_momentum_score"][1], CONFIG.filters.min_momentum_score + 5)
-            diagnosi = f"poche posizioni raggiungono il ladder di take-profit ({ladder_share:.0%}), la maggior parte esce per tempo/trailing senza guadagno: probabile timing d'ingresso debole."
-            perche = "alzare il momentum minimo richiesto in ingresso filtra i token comprati senza una vera accelerazione in corso."
+            proposte["min_score_locale"] = min(BOUNDS["min_score_locale"][1], CONFIG.min_score_locale + 4)
+            proposte["min_liquidity_usd"] = min(BOUNDS["min_liquidity_usd"][1],
+                                                round(CONFIG.filters.min_liquidity_usd * 1.15))
+            diagnosi = (f"il {stop_loss_share:.0%} delle uscite è per stop loss o volatility stop: "
+                        f"entrano token che crollano subito, quindi i filtri d'ingresso sono troppo permissivi.")
+            perche = "alzare lo score minimo e la liquidità minima riduce i token deboli che finiscono subito in stop loss."
+        elif win_rate < 0.40 and tempo_share >= 0.5 and ladder_share < 0.15:
+            proposte["min_momentum_score"] = min(BOUNDS["min_momentum_score"][1],
+                                                 CONFIG.filters.min_momentum_score + 5)
+            diagnosi = (f"il {tempo_share:.0%} delle uscite è per scadenza di tempo e solo il "
+                        f"{ladder_share:.0%} raggiunge il ladder: si compra roba che non si muove, "
+                        f"quindi il timing d'ingresso è debole.")
+            perche = "alzare il momentum minimo filtra i token comprati senza una vera accelerazione in corso."
+        elif trailing_share >= 0.45 and ladder_share < 0.2:
+            # Caso che la versione precedente non poteva nemmeno vedere,
+            # perché confondeva trailing e ladder nello stesso conteggio.
+            proposte["stop_loss_pct"] = max(BOUNDS["stop_loss_pct"][0], CONFIG.risk.stop_loss_pct - 0.03)
+            diagnosi = (f"il {trailing_share:.0%} delle uscite è per trailing stop con solo il "
+                        f"{ladder_share:.0%} di ladder: le posizioni salgono un po' e vengono chiuse "
+                        f"dal trailing prima di arrivare al primo take profit.")
+            perche = ("allargare lo stop loss dà alle posizioni più spazio per respirare prima di "
+                      "essere chiuse; il trailing resta il meccanismo che protegge il guadagno.")
         elif win_rate >= 0.55 and ladder_share >= 0.2:
-            diagnosi = f"win rate {win_rate:.0%} con {ladder_share:.0%} di uscite da ladder di take-profit: il sistema sta funzionando."
+            diagnosi = f"win rate {win_rate:.0%} con {ladder_share:.0%} di uscite da ladder: il sistema sta funzionando."
             perche = "non c'è motivo di cambiare parametri che stanno già producendo risultati positivi."
         else:
             diagnosi = "nessun pattern abbastanza netto nei dati per giustificare un aggiustamento con sicurezza."
